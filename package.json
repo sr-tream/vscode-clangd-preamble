@@ -1,0 +1,128 @@
+{
+    "name": "vscode-clangd-preamble",
+    "publisher": "sr-team",
+    "author": "SR_team",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/sr-tream/vscode-clangd-preamble.git"
+    },
+    "bugs": {
+        "url": "https://github.com/sr-tream/vscode-clangd-preamble/issues"
+    },
+    "homepage": "https://github.com/sr-tream/vscode-clangd-preamble#readme",
+    "displayName": "clangd Non-Self-Contained Header Hook",
+    "description": "Make non-self-contained C/C++ headers parse cleanly under clangd by injecting a fake preamble from a recently-seen includer TU and remapping positions across LSP traffic.",
+    "version": "0.1.0",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "extensionDependencies": [
+        "llvm-vs-code-extensions.vscode-clangd"
+    ],
+    "activationEvents": [
+        "onLanguage:c",
+        "onLanguage:cpp",
+        "onLanguage:cuda-cpp",
+        "onLanguage:objective-c",
+        "onLanguage:objective-cpp"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "configuration": {
+            "title": "clangd Non-Self-Contained Header Hook",
+            "properties": {
+                "clangd-preamble.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Master switch. When off, the middleware passes traffic through unchanged."
+                },
+                "clangd-preamble.maxPreambleLines": {
+                    "type": "integer",
+                    "default": 1500,
+                    "minimum": 1,
+                    "description": "Cap on lines emitted into the synthetic preamble."
+                },
+                "clangd-preamble.maxPreambleBytes": {
+                    "type": "integer",
+                    "default": 65536,
+                    "minimum": 256,
+                    "description": "Cap on bytes emitted into the synthetic preamble."
+                },
+                "clangd-preamble.projectScanLimit": {
+                    "type": "integer",
+                    "default": 2000,
+                    "minimum": 1,
+                    "description": "Maximum number of TU files visited by 'Scan Project for Includers'."
+                },
+                "clangd-preamble.markerComment": {
+                    "type": "string",
+                    "default": "// __NSC_PREAMBLE_END__",
+                    "description": "Single-line comment appended to the preamble so it ends on a known marker."
+                },
+                "clangd-preamble.log": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Log middleware activity to the 'clangd Preamble' output channel."
+                }
+            }
+        },
+        "commands": [
+            {
+                "command": "clangd-preamble.reattach",
+                "title": "clangd Preamble: Reattach Middleware",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.refresh",
+                "title": "clangd Preamble: Refresh Current Header",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.disableBuf",
+                "title": "clangd Preamble: Disable for Current File",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.enableBuf",
+                "title": "clangd Preamble: Enable for Current File",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.dumpGraph",
+                "title": "clangd Preamble: Dump Include Graph",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.dumpState",
+                "title": "clangd Preamble: Dump State for Current File",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.dumpDroppedDiagnostics",
+                "title": "clangd Preamble: Dump Suppressed Preamble Diagnostics",
+                "category": "clangd"
+            },
+            {
+                "command": "clangd-preamble.scanProject",
+                "title": "clangd Preamble: Scan Project for Includer TUs",
+                "category": "clangd"
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run build -- --minify",
+        "build": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+        "watch": "npm run build -- --sourcemap --watch",
+        "typecheck": "tsc -noEmit"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.75.0",
+        "esbuild": "^0.25.0",
+        "typescript": "^5.5.0"
+    }
+}

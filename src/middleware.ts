@@ -1,0 +1,446 @@
+import * as vscode from 'vscode';
+import { Graph, isHeaderPath, isTuPath } from './graph';
+import { buildState, DocState, StateStore } from './preamble';
+import {
+    LspRange,
+    shiftPos, shiftRange,
+    shiftCompletionItem, shiftLocations, shiftDocSymbols, shiftFoldingRanges,
+    processTextEdits, walkWorkspaceEdit, processDiagnostics,
+    shiftSemtokFull, applySemtokEdits,
+} from './positions';
+
+const SENTINEL = '__clangdPreambleInstalled__';
+
+export interface InstallContext {
+    graph: Graph;
+    store: StateStore;
+    isEnabled: () => boolean;
+    log: (msg: string) => void;
+    marker: () => string;
+    onStateChange?: (uri: string) => void;
+}
+
+interface MutableLanguageClient {
+    clientOptions: { middleware?: any };
+    sendNotification(method: any, params?: any): any;
+    sendRequest(method: any, ...args: any[]): Thenable<any>;
+}
+
+function methodOf(x: any): string | undefined {
+    if (typeof x === 'string') return x;
+    if (x && typeof x === 'object' && typeof x.method === 'string') return x.method;
+    return undefined;
+}
+
+function uriToFsPath(uri: string): string {
+    try { return vscode.Uri.parse(uri).fsPath; } catch { return uri; }
+}
+
+function deepCopy<T>(x: T): T { return JSON.parse(JSON.stringify(x)); }
+
+// ===== Outgoing param shifts =====
+type OutFn = (params: any, st: DocState) => void;
+const OUT_POS: OutFn = (p, st) => shiftPos(p.position, st.preambleLines);
+const OUT_RANGE: OutFn = (p, st) => shiftRange(p.range, st.preambleLines);
+
+const OUT: Record<string, OutFn> = {
+    'textDocument/hover': OUT_POS,
+    'textDocument/definition': OUT_POS,
+    'textDocument/declaration': OUT_POS,
+    'textDocument/typeDefinition': OUT_POS,
+    'textDocument/implementation': OUT_POS,
+    'textDocument/references': OUT_POS,
+    'textDocument/documentHighlight': OUT_POS,
+    'textDocument/signatureHelp': OUT_POS,
+    'textDocument/prepareRename': OUT_POS,
+    'textDocument/rename': OUT_POS,
+    'textDocument/prepareCallHierarchy': OUT_POS,
+    'textDocument/prepareTypeHierarchy': OUT_POS,
+    'textDocument/linkedEditingRange': OUT_POS,
+    'textDocument/onTypeFormatting': OUT_POS,
+    'textDocument/completion': OUT_POS,
+    'textDocument/semanticTokens/range': OUT_RANGE,
+    'textDocument/rangeFormatting': OUT_RANGE,
+    'textDocument/inlayHint': OUT_RANGE,
+    'codeLens/resolve': OUT_RANGE,
+    'textDocument/codeAction': (p, st) => {
+        shiftRange(p.range, st.preambleLines);
+        if (p.context && Array.isArray(p.context.diagnostics)) {
+            for (const d of p.context.diagnostics) shiftRange(d.range, st.preambleLines);
+        }
+    },
+    'textDocument/selectionRange': (p, st) => {
+        if (Array.isArray(p.positions)) {
+            for (const pp of p.positions) shiftPos(pp, st.preambleLines);
+        }
+    },
+    'textDocument/semanticTokens/full/delta': (p, st) => {
+        if (st.semtokResultIdUser && p.previousResultId === st.semtokResultIdUser) {
+            p.previousResultId = st.semtokResultIdServer;
+        }
+    },
+};
+
+// ===== Incoming response shifts =====
+type InFn = (result: any, st: DocState) => any;
+
+function shiftSelectionTree(sr: any, n: number): any {
+    if (!sr) return undefined;
+    if (sr.range.end.line < n) return undefined;
+    if (sr.range.start.line < n) {
+        sr.range.start.line = n;
+        sr.range.start.character = 0;
+    }
+    shiftRange(sr.range, -n);
+    if (sr.parent) sr.parent = shiftSelectionTree(sr.parent, n);
+    return sr;
+}
+
+function shiftHierarchyItems(items: any[], st: DocState): any[] {
+    if (!Array.isArray(items)) return items;
+    for (const it of items) {
+        if (it.uri === st.headerUri) {
+            shiftRange(it.range, -st.preambleLines);
+            shiftRange(it.selectionRange, -st.preambleLines);
+        }
+    }
+    return items;
+}
+
+const IN: Record<string, InFn> = {
+    'textDocument/hover': (r, st) => {
+        if (r && r.range) shiftRange(r.range, -st.preambleLines);
+        return r;
+    },
+    'textDocument/definition': (r, st) => shiftLocations(r, -st.preambleLines, st.headerUri),
+    'textDocument/declaration': (r, st) => shiftLocations(r, -st.preambleLines, st.headerUri),
+    'textDocument/typeDefinition': (r, st) => shiftLocations(r, -st.preambleLines, st.headerUri),
+    'textDocument/implementation': (r, st) => shiftLocations(r, -st.preambleLines, st.headerUri),
+    'textDocument/references': (r, st) => shiftLocations(r, -st.preambleLines, st.headerUri),
+    'textDocument/documentHighlight': (r, st) => {
+        if (Array.isArray(r)) for (const h of r) shiftRange(h.range, -st.preambleLines);
+        return r;
+    },
+    'textDocument/inlayHint': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        const out: any[] = [];
+        for (const h of r) {
+            if (h.position && h.position.line >= st.preambleLines) {
+                shiftPos(h.position, -st.preambleLines);
+                if (Array.isArray(h.textEdits)) for (const te of h.textEdits) shiftRange(te.range, -st.preambleLines);
+                if (Array.isArray(h.label)) {
+                    for (const lp of h.label) {
+                        if (lp.location && lp.location.uri === st.headerUri) {
+                            shiftRange(lp.location.range, -st.preambleLines);
+                        }
+                    }
+                }
+                out.push(h);
+            }
+        }
+        return out;
+    },
+    'textDocument/completion': (r, st) => {
+        if (!r) return r;
+        const items = Array.isArray(r) ? r : (r.items as any[] | undefined);
+        if (Array.isArray(items)) for (const it of items) shiftCompletionItem(it, -st.preambleLines);
+        return r;
+    },
+    'textDocument/codeAction': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        for (const a of r) {
+            if (a.edit) walkWorkspaceEdit(a.edit, st.headerUri, st.preambleLines, -1);
+            if (Array.isArray(a.diagnostics)) {
+                for (const d of a.diagnostics) shiftRange(d.range, -st.preambleLines);
+            }
+        }
+        return r;
+    },
+    'textDocument/documentSymbol': (r, st) => shiftDocSymbols(r, st.preambleLines, st.headerUri),
+    'textDocument/foldingRange': (r, st) => Array.isArray(r) ? shiftFoldingRanges(r, st.preambleLines) : r,
+    'textDocument/documentLink': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        const out: any[] = [];
+        for (const dl of r) {
+            if (dl.range.end.line >= st.preambleLines) {
+                if (dl.range.start.line < st.preambleLines) {
+                    dl.range.start.line = st.preambleLines;
+                    dl.range.start.character = 0;
+                }
+                shiftRange(dl.range, -st.preambleLines);
+                out.push(dl);
+            }
+        }
+        return out;
+    },
+    'textDocument/formatting': (r, st) => processTextEdits(r, st.preambleLines),
+    'textDocument/rangeFormatting': (r, st) => processTextEdits(r, st.preambleLines),
+    'textDocument/onTypeFormatting': (r, st) => processTextEdits(r, st.preambleLines),
+    'textDocument/willSaveWaitUntil': (r, st) => processTextEdits(r, st.preambleLines),
+    'textDocument/prepareRename': (r, st) => {
+        if (!r) return r;
+        if (r.range) shiftRange(r.range, -st.preambleLines);
+        else if (r.start && r.end) shiftRange(r as LspRange, -st.preambleLines);
+        return r;
+    },
+    'textDocument/rename': (r, st) => {
+        if (r) walkWorkspaceEdit(r, st.headerUri, st.preambleLines, -1);
+        return r;
+    },
+    'textDocument/codeLens': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        const out: any[] = [];
+        for (const cl of r) {
+            if (cl.range.end.line >= st.preambleLines) {
+                if (cl.range.start.line < st.preambleLines) {
+                    cl.range.start.line = st.preambleLines;
+                    cl.range.start.character = 0;
+                }
+                shiftRange(cl.range, -st.preambleLines);
+                out.push(cl);
+            }
+        }
+        return out;
+    },
+    'codeLens/resolve': (r, st) => {
+        if (r && r.range) shiftRange(r.range, -st.preambleLines);
+        return r;
+    },
+    'textDocument/selectionRange': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        const out: any[] = [];
+        for (const sr of r) {
+            const kept = shiftSelectionTree(sr, st.preambleLines);
+            if (kept) out.push(kept);
+        }
+        return out;
+    },
+    'textDocument/linkedEditingRange': (r, st) => {
+        if (!r || !Array.isArray(r.ranges)) return r;
+        const out: any[] = [];
+        for (const rng of r.ranges) {
+            if (rng.end.line >= st.preambleLines) {
+                if (rng.start.line < st.preambleLines) {
+                    rng.start.line = st.preambleLines;
+                    rng.start.character = 0;
+                }
+                shiftRange(rng, -st.preambleLines);
+                out.push(rng);
+            }
+        }
+        r.ranges = out;
+        return r;
+    },
+    'textDocument/prepareCallHierarchy': (r, st) => shiftHierarchyItems(r, st),
+    'textDocument/prepareTypeHierarchy': (r, st) => shiftHierarchyItems(r, st),
+    'typeHierarchy/supertypes': (r, st) => shiftHierarchyItems(r, st),
+    'typeHierarchy/subtypes': (r, st) => shiftHierarchyItems(r, st),
+    'callHierarchy/incomingCalls': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        for (const c of r) {
+            if (c.from && c.from.uri === st.headerUri) {
+                shiftRange(c.from.range, -st.preambleLines);
+                shiftRange(c.from.selectionRange, -st.preambleLines);
+                if (Array.isArray(c.fromRanges)) for (const rng of c.fromRanges) shiftRange(rng, -st.preambleLines);
+            }
+        }
+        return r;
+    },
+    'callHierarchy/outgoingCalls': (r, st) => {
+        if (!Array.isArray(r)) return r;
+        for (const c of r) {
+            if (c.to && c.to.uri === st.headerUri) {
+                shiftRange(c.to.range, -st.preambleLines);
+                shiftRange(c.to.selectionRange, -st.preambleLines);
+            }
+            if (Array.isArray(c.fromRanges)) for (const rng of c.fromRanges) shiftRange(rng, -st.preambleLines);
+        }
+        return r;
+    },
+    'textDocument/signatureHelp': (r, _st) => r,
+    'textDocument/semanticTokens/full': (r, st) => {
+        if (!r || !Array.isArray(r.data)) return r;
+        const userData = shiftSemtokFull(r.data, st.preambleLines);
+        st.semtokDataServer = r.data;
+        st.semtokDataUser = userData;
+        st.semtokResultIdServer = r.resultId;
+        st.semtokResultIdUser = `nsc-${r.resultId ?? '0'}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        return { resultId: st.semtokResultIdUser, data: userData };
+    },
+    'textDocument/semanticTokens/range': (r, st) => {
+        if (!r || !Array.isArray(r.data)) return r;
+        return { resultId: r.resultId, data: shiftSemtokFull(r.data, st.preambleLines) };
+    },
+    'textDocument/semanticTokens/full/delta': (r, st) => {
+        if (!r) return r;
+        if (Array.isArray(r.data)) {
+            return IN['textDocument/semanticTokens/full'](r, st);
+        }
+        if (Array.isArray(r.edits) && st.semtokDataServer) {
+            st.semtokDataServer = applySemtokEdits(st.semtokDataServer, r.edits);
+            st.semtokDataUser = shiftSemtokFull(st.semtokDataServer, st.preambleLines);
+            st.semtokResultIdServer = r.resultId;
+            st.semtokResultIdUser = `nsc-${r.resultId ?? '0'}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            return { resultId: st.semtokResultIdUser, data: st.semtokDataUser };
+        }
+        return r;
+    },
+};
+
+// ===== Notification handler — didOpen/didChange/didClose =====
+
+function handleOutgoingNotification(method: string, params: any, ctx: InstallContext): any {
+    if (!params) return params;
+    if (method === 'textDocument/didOpen') {
+        const td = params.textDocument;
+        if (!td) return params;
+        const path = uriToFsPath(td.uri);
+        if (isHeaderPath(path)) {
+            const includer = ctx.graph.findIncluder(path);
+            if (includer) {
+                const st = buildState(path, td.uri, td.text, includer, ctx.marker());
+                ctx.store.set(td.uri, st);
+                ctx.onStateChange?.(td.uri);
+                ctx.log(`didOpen header ${path}: preamble ${st.preambleLines} lines from ${includer.tuPath} (direct=${includer.direct})`);
+                const copy = deepCopy(params);
+                copy.textDocument.text = st.preambleText + (copy.textDocument.text ?? '');
+                return copy;
+            } else {
+                ctx.log(`didOpen header ${path}: no includer found (passthrough)`);
+            }
+        } else if (isTuPath(path) && typeof td.text === 'string') {
+            ctx.graph.observeTu(path, td.text);
+            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes`);
+        }
+        return params;
+    }
+    if (method === 'textDocument/didChange') {
+        const uri = params.textDocument?.uri;
+        if (!uri) return params;
+        const st = ctx.store.get(uri);
+        let result = params;
+        if (st && st.active) {
+            result = deepCopy(params);
+            for (const c of result.contentChanges) {
+                if (c.range) shiftRange(c.range, st.preambleLines);
+                else if (typeof c.text === 'string') c.text = st.preambleText + c.text;
+            }
+        }
+        const path = uriToFsPath(uri);
+        if (isTuPath(path)) ctx.graph.invalidate(path);
+        return result;
+    }
+    if (method === 'textDocument/didClose') {
+        const uri = params.textDocument?.uri;
+        if (uri && ctx.store.delete(uri)) ctx.onStateChange?.(uri);
+        return params;
+    }
+    return params;
+}
+
+// ===== Install hooks on a running language client =====
+
+export function installHooks(client: MutableLanguageClient, ctx: InstallContext): boolean {
+    const opts: any = client.clientOptions ?? ((client as any).clientOptions = {});
+    const middleware: any = opts.middleware ?? (opts.middleware = {});
+    if (middleware[SENTINEL]) return false;
+
+    // 1) Mutate the existing middleware object in place so it stays live for the
+    //    already-running client. Don't overwrite — chain to whatever filter-files
+    //    or other extensions installed.
+    const prevDiag = middleware.handleDiagnostics;
+    middleware.handleDiagnostics = (uri: vscode.Uri, diagnostics: vscode.Diagnostic[], next: any) => {
+        if (!ctx.isEnabled()) return (prevDiag ?? next)(uri, diagnostics, next);
+        const st = ctx.store.get(uri.toString());
+        if (!st || !st.active) return (prevDiag ?? next)(uri, diagnostics, next);
+
+        const kept: vscode.Diagnostic[] = [];
+        const dropped: vscode.Diagnostic[] = [];
+        for (const d of diagnostics) {
+            if (d.range.end.line < st.preambleLines) { dropped.push(d); continue; }
+            const startLine = Math.max(d.range.start.line, st.preambleLines);
+            const startChar = d.range.start.line < st.preambleLines ? 0 : d.range.start.character;
+            const newRange = new vscode.Range(
+                startLine - st.preambleLines, startChar,
+                d.range.end.line - st.preambleLines, d.range.end.character,
+            );
+            const nd = new vscode.Diagnostic(newRange, d.message, d.severity);
+            nd.code = d.code;
+            nd.source = d.source;
+            nd.tags = d.tags ? [...d.tags] : undefined;
+            if (d.relatedInformation) {
+                const rel: vscode.DiagnosticRelatedInformation[] = [];
+                for (const ri of d.relatedInformation) {
+                    if (ri.location.uri.toString() === st.headerUri) {
+                        if (ri.location.range.end.line < st.preambleLines) continue;
+                        const rsLine = Math.max(ri.location.range.start.line, st.preambleLines);
+                        const rsChar = ri.location.range.start.line < st.preambleLines ? 0 : ri.location.range.start.character;
+                        rel.push(new vscode.DiagnosticRelatedInformation(
+                            new vscode.Location(
+                                ri.location.uri,
+                                new vscode.Range(
+                                    rsLine - st.preambleLines, rsChar,
+                                    ri.location.range.end.line - st.preambleLines, ri.location.range.end.character,
+                                ),
+                            ),
+                            ri.message,
+                        ));
+                    } else {
+                        rel.push(ri);
+                    }
+                }
+                nd.relatedInformation = rel;
+            }
+            kept.push(nd);
+        }
+        st.droppedDiags = dropped;
+        ctx.log(`publishDiagnostics ${uri.toString()}: ${diagnostics.length} → ${kept.length} (dropped ${dropped.length})`);
+        return (prevDiag ?? next)(uri, kept, next);
+    };
+    middleware[SENTINEL] = true;
+
+    // 2) Wrap sendNotification on the running client instance. We rebind to the
+    //    client (notification methods may use `this`).
+    const origNotify = client.sendNotification.bind(client) as (...args: any[]) => any;
+    client.sendNotification = function (this: any, ...args: any[]) {
+        if (!ctx.isEnabled()) return origNotify(...args);
+        const method = methodOf(args[0]);
+        if (!method) return origNotify(...args);
+        const newParams = handleOutgoingNotification(method, args[1], ctx);
+        const newArgs = args.slice();
+        newArgs[1] = newParams;
+        return origNotify(...newArgs);
+    } as any;
+
+    // 3) Wrap sendRequest similarly.
+    const origRequest = client.sendRequest.bind(client) as (...args: any[]) => Thenable<any>;
+    client.sendRequest = function (this: any, ...args: any[]): Thenable<any> {
+        if (!ctx.isEnabled()) return origRequest(...args);
+        const method = methodOf(args[0]);
+        if (!method) return origRequest(...args);
+        const params = args[1];
+        const uri: string | undefined = params?.textDocument?.uri;
+        const st = uri ? ctx.store.get(uri) : undefined;
+        if (!st || !st.active) return origRequest(...args);
+
+        const outFn = OUT[method];
+        const newArgs = args.slice();
+        if (outFn) {
+            newArgs[1] = deepCopy(params);
+            outFn(newArgs[1], st);
+        }
+
+        const promise = origRequest(...newArgs);
+        const inFn = IN[method];
+        if (!inFn) return promise;
+        return Promise.resolve(promise).then((result: any) => {
+            if (result == null) return result;
+            try { return inFn(result, st); } catch (e) {
+                ctx.log(`IN[${method}] threw: ${(e as Error).message}`);
+                return result;
+            }
+        });
+    } as any;
+
+    return true;
+}
