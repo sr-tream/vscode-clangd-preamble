@@ -400,6 +400,25 @@ function handleOutgoingNotification(
         }
         return params;
     }
+    // The clangd extension to `workspace/didChangeConfiguration` (Protocol.h:575
+    // in llvm-project) carries `compilationDatabaseChanges` keyed by source
+    // path. vscode-clangd-cmake delivers per-file flags this way. clangd
+    // updates its in-memory CDB but does NOT re-parse already-open files, so a
+    // header that we opened (and clangd parsed against fallback flags) before
+    // the config arrived stays bound to those wrong flags. After the
+    // notification reaches clangd, replay didOpen for any active header whose
+    // includer TU appears in the change set so it re-fetches flags.
+    if (method === 'workspace/didChangeConfiguration') {
+        const changes = params?.settings?.compilationDatabaseChanges;
+        if (changes && typeof changes === 'object') {
+            const changedTus = new Set<string>(Object.keys(changes));
+            if (changedTus.size > 0) {
+                ctx.log(`workspace/didChangeConfiguration: ${changedTus.size} TU flag entries`);
+                setImmediate(() => refreshHeadersForFlagChange(ctx, scheduleReissue, changedTus));
+            }
+        }
+        return params;
+    }
     return params;
 }
 
@@ -485,6 +504,32 @@ function refreshActiveHeadersForTu(
         const includer = ctx.graph.findIncluder(fsPath);
         if (!includer || includer.tuPath !== observedTu) continue;
         ctx.log(`active header ${fsPath}: includer ${observedTu} now in editor, replaying didOpen`);
+        scheduleReissue({
+            uri,
+            languageId: doc.languageId,
+            version: doc.version,
+            text: doc.getText(),
+        });
+    }
+}
+
+// Replay `didOpen` for active headers whose includer TU is in `changedTus`
+// (the keys of the `compilationDatabaseChanges` clangd extension). Triggered
+// from a `workspace/didChangeConfiguration` interceptor so headers parsed
+// against stale or fallback flags get a fresh parse with the new CDB entries.
+function refreshHeadersForFlagChange(
+    ctx: InstallContext,
+    scheduleReissue: (h: PendingHeader) => void,
+    changedTus: Set<string>,
+): void {
+    for (const doc of vscode.workspace.textDocuments) {
+        const uri = doc.uri.toString();
+        const st = ctx.store.get(uri);
+        if (!st || !st.active) continue;
+        if (!changedTus.has(st.includerTu)) continue;
+        const fsPath = doc.uri.fsPath;
+        if (!isHeaderPath(fsPath)) continue;
+        ctx.log(`active header ${fsPath}: includer TU ${st.includerTu} flags changed, replaying didOpen`);
         scheduleReissue({
             uri,
             languageId: doc.languageId,
