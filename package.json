@@ -1,7 +1,9 @@
 {
     "name": "vscode-clangd-preamble",
     "publisher": "sr-team",
-    "author": "SR_team",
+    "author": {
+        "name": "SR_team"
+    },
     "license": "MIT",
     "repository": {
         "type": "git",
