@@ -43,6 +43,13 @@ const pendingHeaders = new Map<string, PendingHeader>();
 export function _pendingCount(): number { return pendingHeaders.size; }
 export function _pendingUris(): string[] { return Array.from(pendingHeaders.keys()); }
 
+// One-shot bypass: URIs the user manually requested via Refresh/EnableBuf
+// should be processed with findIncluder({force:true}) on the next didOpen,
+// overriding the self-contained heuristic. Consumed once.
+const forcedUris = new Set<string>();
+export function markForced(uri: string): void { forcedUris.add(uri); }
+export function clearForced(uri: string): void { forcedUris.delete(uri); }
+
 function uriToFsPath(uri: string): string {
     try { return vscode.Uri.parse(uri).fsPath; } catch { return uri; }
 }
@@ -312,7 +319,8 @@ function handleOutgoingNotification(
         if (!td) return params;
         const path = uriToFsPath(td.uri);
         if (isHeaderPath(path)) {
-            const includer = ctx.graph.findIncluder(path);
+            const force = forcedUris.delete(td.uri);
+            const includer = ctx.graph.findIncluder(path, { force });
             if (includer) {
                 const st = buildState(path, td.uri, td.text, includer, ctx.marker());
                 ctx.store.set(td.uri, st);
@@ -335,7 +343,12 @@ function handleOutgoingNotification(
         } else if (isTuPath(path) && typeof td.text === 'string') {
             ctx.graph.observeTu(path, td.text);
             ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size})`);
-            tryResolvePending(ctx, scheduleReissue);
+            // Promotion does disk I/O for every pending header (findIncluder +
+            // cycle filter + file reads). Defer it off the wrapped-notify path
+            // so didOpen stays responsive on large projects.
+            if (pendingHeaders.size > 0) {
+                setImmediate(() => tryResolvePending(ctx, scheduleReissue));
+            }
         }
         return params;
     }

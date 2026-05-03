@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Graph } from './graph';
 import { StateStore } from './preamble';
-import { installHooks, InstallContext, resolvePendingNow, _pendingUris } from './middleware';
+import { installHooks, InstallContext, resolvePendingNow, _pendingUris, markForced } from './middleware';
 
 const CLANGD_EXTENSION_ID = 'llvm-vs-code-extensions.vscode-clangd';
 const CFG_NS = 'clangd-preamble';
@@ -194,6 +194,7 @@ async function cmdRefresh(): Promise<void> {
     const uri = doc.uri.toString();
     const existing = store.get(uri);
     if (existing) graph.invalidate(existing.includerTu);
+    markForced(uri);
     await reissueDidOpen(attachedClient, doc);
     const st = store.get(uri);
     if (st) {
@@ -222,6 +223,7 @@ async function cmdDisableBuf(): Promise<void> {
 async function cmdEnableBuf(): Promise<void> {
     const doc = activeHeaderDoc();
     if (!doc || !attachedClient) return;
+    markForced(doc.uri.toString());
     await reissueDidOpen(attachedClient, doc);
 }
 
