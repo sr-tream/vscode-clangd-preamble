@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { Graph, isHeaderPath, isTuPath } from './graph';
 import { buildState, DocState, StateStore } from './preamble';
 import {
@@ -10,6 +11,16 @@ import {
 } from './positions';
 
 const SENTINEL = '__clangdPreambleInstalled__';
+const SUPPRESS = Symbol.for('clangdPreamble.suppress');
+
+// Companion TUs opened virtually (bypassing wrapper) so clangd builds their
+// PCH before the user opens them in the editor.
+const virtualTus = new Map<string, { uri: string; pchReady: boolean }>();
+
+// Header URIs whose didClose is part of a scheduleReissue cycle (didClose +
+// didOpen). Used to skip companion cleanup during the cycle so we don't
+// close-and-reopen the companion mid-reissue and trigger an infinite loop.
+const reissueInProgress = new Set<string>();
 
 export interface InstallContext {
     graph: Graph;
@@ -64,6 +75,42 @@ function uriToFsPath(uri: string): string {
 }
 
 function deepCopy<T>(x: T): T { return JSON.parse(JSON.stringify(x)); }
+
+function openTuVirtually(origNotify: (...args: any[]) => any, tuPath: string): void {
+    if (virtualTus.has(tuPath)) return;
+    let text: string;
+    try { text = fs.readFileSync(tuPath, 'utf8'); } catch { return; }
+    const uri = vscode.Uri.file(tuPath).toString();
+    const ext = tuPath.split('.').pop() ?? 'cpp';
+    const lang = ext === 'c' || ext === 'C' ? 'c' : 'cpp';
+    origNotify('textDocument/didOpen', {
+        textDocument: { uri, languageId: lang, version: 0, text },
+    });
+    virtualTus.set(tuPath, { uri, pchReady: false });
+}
+
+function closeTuVirtually(origNotify: (...args: any[]) => any, tuPath: string): void {
+    const vt = virtualTus.get(tuPath);
+    if (!vt) return;
+    origNotify('textDocument/didClose', { textDocument: { uri: vt.uri } });
+    virtualTus.delete(tuPath);
+}
+
+// Returns true if tuPath was virtually open (caller should suppress the
+// duplicate didOpen that the editor would otherwise send to clangd).
+function promoteVirtualTu(tuPath: string): boolean {
+    if (!virtualTus.has(tuPath)) return false;
+    virtualTus.delete(tuPath);
+    return true;
+}
+
+// Track a TU as virtually open without sending didOpen — clangd already has
+// the file open from the user's prior didOpen. Caller must suppress the
+// matching didClose so clangd keeps its PCH alive for active headers.
+function demoteToVirtual(tuPath: string, uri: string): void {
+    if (virtualTus.has(tuPath)) return;
+    virtualTus.set(tuPath, { uri, pchReady: true });
+}
 
 // ===== Outgoing param shifts =====
 type OutFn = (params: any, st: DocState) => void;
@@ -321,6 +368,7 @@ function handleOutgoingNotification(
     params: any,
     ctx: InstallContext,
     scheduleReissue: (h: PendingHeader) => void,
+    origNotify: (...args: any[]) => any,
 ): any {
     if (!params) return params;
     if (method === 'textDocument/didOpen') {
@@ -336,6 +384,14 @@ function handleOutgoingNotification(
                 pendingHeaders.delete(td.uri);
                 ctx.onStateChange?.(td.uri);
                 ctx.log(`didOpen header ${path}: preamble ${st.preambleLines} lines from ${includer.tuPath} (direct=${includer.direct})`);
+                // Open companion virtually if not already live so clangd builds its PCH
+                if (!tusObservedFromEditor.has(includer.tuPath) && !virtualTus.has(includer.tuPath)) {
+                    const isOpenInEditor = vscode.workspace.textDocuments.some(d => d.uri.fsPath === includer.tuPath);
+                    if (!isOpenInEditor) {
+                        openTuVirtually(origNotify, includer.tuPath);
+                        ctx.log(`didOpen header ${path}: opening companion ${includer.tuPath} virtually for PCH`);
+                    }
+                }
                 const copy = deepCopy(params);
                 copy.textDocument.text = st.preambleText + (copy.textDocument.text ?? '');
                 return copy;
@@ -350,10 +406,11 @@ function handleOutgoingNotification(
                 ctx.log(`didOpen header ${path}: no includer found, marked pending (queue=${pendingHeaders.size})`);
             }
         } else if (isTuPath(path) && typeof td.text === 'string') {
+            const alreadyOpen = promoteVirtualTu(path);
             const firstEditorObservation = !tusObservedFromEditor.has(path);
             tusObservedFromEditor.add(path);
             ctx.graph.observeTu(path, td.text);
-            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size}, first-editor=${firstEditorObservation})`);
+            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size}, first-editor=${firstEditorObservation}, promoted=${alreadyOpen})`);
             // Promotion does disk I/O for every pending header (findIncluder +
             // cycle filter + file reads). Defer it off the wrapped-notify path
             // so didOpen stays responsive on large projects.
@@ -363,6 +420,8 @@ function handleOutgoingNotification(
                     if (firstEditorObservation) refreshActiveHeadersForTu(ctx, scheduleReissue, path);
                 });
             }
+            // clangd already has this file open via virtual open; suppress the duplicate didOpen
+            if (alreadyOpen) return SUPPRESS;
         }
         return params;
     }
@@ -393,10 +452,30 @@ function handleOutgoingNotification(
     if (method === 'textDocument/didClose') {
         const uri = params.textDocument?.uri;
         if (uri) {
+            const fsPath = uriToFsPath(uri);
+            const st = ctx.store.get(uri);
             const had = ctx.store.delete(uri) || pendingHeaders.delete(uri);
             if (had) ctx.onStateChange?.(uri);
-            const fsPath = uriToFsPath(uri);
-            if (isTuPath(fsPath)) tusObservedFromEditor.delete(fsPath);
+            if (isTuPath(fsPath)) {
+                tusObservedFromEditor.delete(fsPath);
+                // If any active header still uses this TU as its includer,
+                // keep it open in clangd virtually — header diagnostics depend
+                // on the companion's PCH, which clangd would drop on didClose.
+                const stillUsedByHeader = Array.from(ctx.store.values()).some(s => s.includerTu === fsPath);
+                if (stillUsedByHeader) {
+                    demoteToVirtual(fsPath, uri);
+                    ctx.log(`didClose TU ${fsPath}: demoted to virtual (still used by active header)`);
+                    return SUPPRESS;
+                }
+            } else if (st && isHeaderPath(fsPath) && !reissueInProgress.has(uri)) {
+                // Header genuinely closing (not a scheduleReissue cycle):
+                // close the virtual companion if no other header uses it.
+                const compPath = st.includerTu;
+                if (compPath && virtualTus.has(compPath)) {
+                    const stillUsedComp = Array.from(ctx.store.values()).some(s => s.includerTu === compPath);
+                    if (!stillUsedComp) closeTuVirtually(origNotify, compPath);
+                }
+            }
         }
         return params;
     }
@@ -561,6 +640,17 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
     const prevDiag = middleware.handleDiagnostics;
     middleware.handleDiagnostics = (uri: vscode.Uri, diagnostics: vscode.Diagnostic[], next: any) => {
         if (!ctx.isEnabled()) return (prevDiag ?? next)(uri, diagnostics, next);
+
+        // Virtual TU PCH-ready: first publishDiagnostics for the companion means
+        // its PCH is built; re-analyze any header that opened before it was ready.
+        const diagFsPath = uri.fsPath;
+        const diagVt = virtualTus.get(diagFsPath);
+        if (diagVt && !diagVt.pchReady) {
+            diagVt.pchReady = true;
+            const sr = ctx.scheduleReissue;
+            if (sr) setImmediate(() => refreshActiveHeadersForTu(ctx, sr, diagFsPath));
+        }
+
         const uriStr = uri.toString();
         const st = ctx.store.get(uriStr);
         if (!st || !st.active) {
@@ -625,6 +715,7 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
     const origNotify = client.sendNotification.bind(client) as (...args: any[]) => any;
     const scheduleReissue = (h: PendingHeader) => {
         queueMicrotask(() => {
+            reissueInProgress.add(h.uri);
             try {
                 client.sendNotification('textDocument/didClose', { textDocument: { uri: h.uri } });
                 client.sendNotification('textDocument/didOpen', {
@@ -637,6 +728,8 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
                 });
             } catch (e) {
                 ctx.log(`reissue ${h.uri} failed: ${(e as Error).message}`);
+            } finally {
+                reissueInProgress.delete(h.uri);
             }
         });
     };
@@ -645,7 +738,8 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
         if (!ctx.isEnabled()) return origNotify(...args);
         const method = methodOf(args[0]);
         if (!method) return origNotify(...args);
-        const newParams = handleOutgoingNotification(method, args[1], ctx, scheduleReissue);
+        const newParams = handleOutgoingNotification(method, args[1], ctx, scheduleReissue, origNotify);
+        if (newParams === SUPPRESS) return;
         const newArgs = args.slice();
         newArgs[1] = newParams;
         return origNotify(...newArgs);
