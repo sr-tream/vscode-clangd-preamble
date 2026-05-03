@@ -50,6 +50,15 @@ const forcedUris = new Set<string>();
 export function markForced(uri: string): void { forcedUris.add(uri); }
 export function clearForced(uri: string): void { forcedUris.delete(uri); }
 
+// TU paths whose `didOpen` we have observed via the editor (wrapped notify or
+// the install-time syncOpenDocs sweep). Distinct from `graph.tuIncludes`,
+// which also contains disk-only entries created by the companion-TU fallback
+// in `findIncluder`. We refresh active header state the first time a TU
+// appears in this set, so a header whose preamble was synthesized from a
+// disk-read companion gets re-evaluated when the user finally opens the
+// source. Cleared on `didClose` for the TU.
+const tusObservedFromEditor = new Set<string>();
+
 function uriToFsPath(uri: string): string {
     try { return vscode.Uri.parse(uri).fsPath; } catch { return uri; }
 }
@@ -341,13 +350,18 @@ function handleOutgoingNotification(
                 ctx.log(`didOpen header ${path}: no includer found, marked pending (queue=${pendingHeaders.size})`);
             }
         } else if (isTuPath(path) && typeof td.text === 'string') {
+            const firstEditorObservation = !tusObservedFromEditor.has(path);
+            tusObservedFromEditor.add(path);
             ctx.graph.observeTu(path, td.text);
-            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size})`);
+            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size}, first-editor=${firstEditorObservation})`);
             // Promotion does disk I/O for every pending header (findIncluder +
             // cycle filter + file reads). Defer it off the wrapped-notify path
             // so didOpen stays responsive on large projects.
-            if (pendingHeaders.size > 0) {
-                setImmediate(() => tryResolvePending(ctx, scheduleReissue));
+            if (pendingHeaders.size > 0 || firstEditorObservation) {
+                setImmediate(() => {
+                    tryResolvePending(ctx, scheduleReissue);
+                    if (firstEditorObservation) refreshActiveHeadersForTu(ctx, scheduleReissue, path);
+                });
             }
         }
         return params;
@@ -381,6 +395,8 @@ function handleOutgoingNotification(
         if (uri) {
             const had = ctx.store.delete(uri) || pendingHeaders.delete(uri);
             if (had) ctx.onStateChange?.(uri);
+            const fsPath = uriToFsPath(uri);
+            if (isTuPath(fsPath)) tusObservedFromEditor.delete(fsPath);
         }
         return params;
     }
@@ -390,22 +406,91 @@ function handleOutgoingNotification(
 // Walk pending headers; for each whose graph now resolves an includer, schedule
 // a didClose+didOpen replay through the wrapped notify so preamble injection
 // runs against the saved original text.
+//
+// Also sweep VS Code's open documents for headers that have NO state and aren't
+// in pendingHeaders — typically headers whose original didOpen fired before our
+// sendNotification wrapper was installed (clangd client started, sent didOpens
+// for already-open docs, then this extension activated). Mirrors the nvim
+// `try_promote_pending` walk over all loaded buffers.
 function tryResolvePending(
     ctx: InstallContext,
     scheduleReissue: (h: PendingHeader) => void,
 ): void {
-    if (pendingHeaders.size === 0) return;
-    const ready: PendingHeader[] = [];
-    for (const [uri, h] of pendingHeaders) {
-        const path = uriToFsPath(uri);
-        const inc = ctx.graph.findIncluder(path);
-        if (inc) ready.push(h);
+    if (pendingHeaders.size > 0) {
+        const ready: PendingHeader[] = [];
+        for (const [uri, h] of pendingHeaders) {
+            const path = uriToFsPath(uri);
+            if (ctx.graph.findIncluder(path)) ready.push(h);
+        }
+        for (const h of ready) {
+            pendingHeaders.delete(h.uri);
+            ctx.onStateChange?.(h.uri);
+            ctx.log(`pending header ${uriToFsPath(h.uri)}: includer now available, replaying didOpen`);
+            scheduleReissue(h);
+        }
     }
-    for (const h of ready) {
-        pendingHeaders.delete(h.uri);
-        ctx.onStateChange?.(h.uri);
-        ctx.log(`pending header ${uriToFsPath(h.uri)}: includer now available, replaying didOpen`);
-        scheduleReissue(h);
+    for (const doc of vscode.workspace.textDocuments) {
+        const uri = doc.uri.toString();
+        if (ctx.store.get(uri)) continue;
+        if (pendingHeaders.has(uri)) continue;
+        const fsPath = doc.uri.fsPath;
+        if (!isHeaderPath(fsPath)) continue;
+        if (!ctx.graph.findIncluder(fsPath)) continue;
+        ctx.log(`untracked header ${fsPath}: includer now available, replaying didOpen`);
+        scheduleReissue({
+            uri,
+            languageId: doc.languageId,
+            version: doc.version,
+            text: doc.getText(),
+        });
+    }
+}
+
+// One-shot at install: VS Code's language client may have already sent didOpens
+// for documents open at activation, before our sendNotification wrapper was in
+// place. Observe those TUs into the graph from buffer text, then run the same
+// pending sweep so any pre-wrap headers get a wrapped-replay didOpen with the
+// preamble injected. Mirrors the per-buffer reissue inside nvim's `attach()`.
+function syncOpenDocs(
+    ctx: InstallContext,
+    scheduleReissue: (h: PendingHeader) => void,
+): void {
+    for (const doc of vscode.workspace.textDocuments) {
+        const fsPath = doc.uri.fsPath;
+        if (isTuPath(fsPath)) {
+            tusObservedFromEditor.add(fsPath);
+            ctx.graph.observeTu(fsPath, doc.getText());
+        }
+    }
+    tryResolvePending(ctx, scheduleReissue);
+}
+
+// When a TU's `didOpen` arrives via the editor for the first time, walk active
+// header state and replay `didOpen` for any header whose includer pick now
+// resolves to that TU. Catches the case where a header opened first, the
+// companion-TU disk fallback synthesized a thin preamble, and the user later
+// opens the actual source — without this, the header stays bound to the
+// disk-read snapshot and never re-evaluates.
+function refreshActiveHeadersForTu(
+    ctx: InstallContext,
+    scheduleReissue: (h: PendingHeader) => void,
+    observedTu: string,
+): void {
+    for (const doc of vscode.workspace.textDocuments) {
+        const uri = doc.uri.toString();
+        const st = ctx.store.get(uri);
+        if (!st || !st.active) continue;
+        const fsPath = doc.uri.fsPath;
+        if (!isHeaderPath(fsPath)) continue;
+        const includer = ctx.graph.findIncluder(fsPath);
+        if (!includer || includer.tuPath !== observedTu) continue;
+        ctx.log(`active header ${fsPath}: includer ${observedTu} now in editor, replaying didOpen`);
+        scheduleReissue({
+            uri,
+            languageId: doc.languageId,
+            version: doc.version,
+            text: doc.getText(),
+        });
     }
 }
 
@@ -550,6 +635,9 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
             }
         });
     } as any;
+
+    // Catch up with documents already opened pre-wrap.
+    queueMicrotask(() => syncOpenDocs(ctx, scheduleReissue));
 
     return true;
 }
