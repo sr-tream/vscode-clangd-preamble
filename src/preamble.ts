@@ -50,10 +50,18 @@ function dedupPrefixLines(prefixLines: string[], headerSet: Set<string>): string
     return out;
 }
 
+// Wrap the synthetic preamble in `#if __INCLUDE_LEVEL__ == 0 ... #endif`.
+// __INCLUDE_LEVEL__ is 0 only when the file is the translation-unit root, so
+// the body is active when the user opens the header directly (which is the
+// only time we want it) and skipped when the same header is later #include'd
+// by some other TU through its normal chain — preventing redefinition / order-
+// of-include collisions.
 export function buildPreambleText(prefixLines: string[], marker: string): string {
-    let body = prefixLines.join('\n');
-    if (body.length > 0) body += '\n';
-    return body + marker + '\n';
+    const body: string[] = ['#if __INCLUDE_LEVEL__ == 0'];
+    for (const line of prefixLines) body.push(line);
+    body.push(marker);
+    body.push('#endif');
+    return body.join('\n') + '\n';
 }
 
 export function buildState(
