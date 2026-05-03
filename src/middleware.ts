@@ -18,6 +18,9 @@ export interface InstallContext {
     log: (msg: string) => void;
     marker: () => string;
     onStateChange?: (uri: string) => void;
+    // Set by installHooks; lets external code (commands, scans) trigger a
+    // pending-header replay that goes back through the wrapped notify.
+    scheduleReissue?: (h: PendingHeader) => void;
 }
 
 interface MutableLanguageClient {
@@ -31,6 +34,14 @@ function methodOf(x: any): string | undefined {
     if (x && typeof x === 'object' && typeof x.method === 'string') return x.method;
     return undefined;
 }
+
+// Headers opened before any includer TU is known. Keyed by URI; value is the
+// original didOpen.textDocument so we can replay it once the graph gains a
+// matching TU.
+export interface PendingHeader { uri: string; languageId: string; version: number; text: string; }
+const pendingHeaders = new Map<string, PendingHeader>();
+export function _pendingCount(): number { return pendingHeaders.size; }
+export function _pendingUris(): string[] { return Array.from(pendingHeaders.keys()); }
 
 function uriToFsPath(uri: string): string {
     try { return vscode.Uri.parse(uri).fsPath; } catch { return uri; }
@@ -289,7 +300,12 @@ const IN: Record<string, InFn> = {
 
 // ===== Notification handler — didOpen/didChange/didClose =====
 
-function handleOutgoingNotification(method: string, params: any, ctx: InstallContext): any {
+function handleOutgoingNotification(
+    method: string,
+    params: any,
+    ctx: InstallContext,
+    scheduleReissue: (h: PendingHeader) => void,
+): any {
     if (!params) return params;
     if (method === 'textDocument/didOpen') {
         const td = params.textDocument;
@@ -300,17 +316,26 @@ function handleOutgoingNotification(method: string, params: any, ctx: InstallCon
             if (includer) {
                 const st = buildState(path, td.uri, td.text, includer, ctx.marker());
                 ctx.store.set(td.uri, st);
+                pendingHeaders.delete(td.uri);
                 ctx.onStateChange?.(td.uri);
                 ctx.log(`didOpen header ${path}: preamble ${st.preambleLines} lines from ${includer.tuPath} (direct=${includer.direct})`);
                 const copy = deepCopy(params);
                 copy.textDocument.text = st.preambleText + (copy.textDocument.text ?? '');
                 return copy;
             } else {
-                ctx.log(`didOpen header ${path}: no includer found (passthrough)`);
+                pendingHeaders.set(td.uri, {
+                    uri: td.uri,
+                    languageId: td.languageId,
+                    version: td.version ?? 0,
+                    text: td.text ?? '',
+                });
+                ctx.onStateChange?.(td.uri);
+                ctx.log(`didOpen header ${path}: no includer found, marked pending (queue=${pendingHeaders.size})`);
             }
         } else if (isTuPath(path) && typeof td.text === 'string') {
             ctx.graph.observeTu(path, td.text);
-            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes`);
+            ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size})`);
+            tryResolvePending(ctx, scheduleReissue);
         }
         return params;
     }
@@ -327,15 +352,57 @@ function handleOutgoingNotification(method: string, params: any, ctx: InstallCon
             }
         }
         const path = uriToFsPath(uri);
-        if (isTuPath(path)) ctx.graph.invalidate(path);
+        if (isTuPath(path)) {
+            ctx.graph.invalidate(path);
+            // Re-observe with the dirty buffer text would need the full text here;
+            // didChange only carries deltas. Defer fresh observation to disk read on
+            // demand via tryResolvePending (which calls findIncluder, which falls back
+            // to observeTuFromDisk via the companion path when a basename match is
+            // missing). Worst case: next didOpen of this TU re-observes.
+        }
+        // Also pending headers might track this changed buffer.
         return result;
     }
     if (method === 'textDocument/didClose') {
         const uri = params.textDocument?.uri;
-        if (uri && ctx.store.delete(uri)) ctx.onStateChange?.(uri);
+        if (uri) {
+            const had = ctx.store.delete(uri) || pendingHeaders.delete(uri);
+            if (had) ctx.onStateChange?.(uri);
+        }
         return params;
     }
     return params;
+}
+
+// Walk pending headers; for each whose graph now resolves an includer, schedule
+// a didClose+didOpen replay through the wrapped notify so preamble injection
+// runs against the saved original text.
+function tryResolvePending(
+    ctx: InstallContext,
+    scheduleReissue: (h: PendingHeader) => void,
+): void {
+    if (pendingHeaders.size === 0) return;
+    const ready: PendingHeader[] = [];
+    for (const [uri, h] of pendingHeaders) {
+        const path = uriToFsPath(uri);
+        const inc = ctx.graph.findIncluder(path);
+        if (inc) ready.push(h);
+    }
+    for (const h of ready) {
+        pendingHeaders.delete(h.uri);
+        ctx.onStateChange?.(h.uri);
+        ctx.log(`pending header ${uriToFsPath(h.uri)}: includer now available, replaying didOpen`);
+        scheduleReissue(h);
+    }
+}
+
+// Trigger a pending-header sweep externally (e.g. after a project scan).
+// Returns the number of pending headers that resolved.
+export function resolvePendingNow(ctx: InstallContext): number {
+    if (!ctx.scheduleReissue) return 0;
+    const before = pendingHeaders.size;
+    tryResolvePending(ctx, ctx.scheduleReissue);
+    return before - pendingHeaders.size;
 }
 
 // ===== Install hooks on a running language client =====
@@ -351,8 +418,17 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
     const prevDiag = middleware.handleDiagnostics;
     middleware.handleDiagnostics = (uri: vscode.Uri, diagnostics: vscode.Diagnostic[], next: any) => {
         if (!ctx.isEnabled()) return (prevDiag ?? next)(uri, diagnostics, next);
-        const st = ctx.store.get(uri.toString());
-        if (!st || !st.active) return (prevDiag ?? next)(uri, diagnostics, next);
+        const uriStr = uri.toString();
+        const st = ctx.store.get(uriStr);
+        if (!st || !st.active) {
+            // If a pending header is now publishing diagnostics (typically the
+            // unresolved-symbol cascade), check if the graph has since gained an
+            // includer and replay didOpen if so.
+            if (pendingHeaders.has(uriStr) && diagnostics.length > 0) {
+                resolvePendingNow(ctx);
+            }
+            return (prevDiag ?? next)(uri, diagnostics, next);
+        }
 
         const kept: vscode.Diagnostic[] = [];
         const dropped: vscode.Diagnostic[] = [];
@@ -400,13 +476,33 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
     middleware[SENTINEL] = true;
 
     // 2) Wrap sendNotification on the running client instance. We rebind to the
-    //    client (notification methods may use `this`).
+    //    client (notification methods may use `this`). The scheduleReissue
+    //    callback is stable: it captures `client` so pending-header replays go
+    //    through the WRAPPED notify (which finds the now-available includer).
     const origNotify = client.sendNotification.bind(client) as (...args: any[]) => any;
+    const scheduleReissue = (h: PendingHeader) => {
+        queueMicrotask(() => {
+            try {
+                client.sendNotification('textDocument/didClose', { textDocument: { uri: h.uri } });
+                client.sendNotification('textDocument/didOpen', {
+                    textDocument: {
+                        uri: h.uri,
+                        languageId: h.languageId,
+                        version: h.version,
+                        text: h.text,
+                    },
+                });
+            } catch (e) {
+                ctx.log(`reissue ${h.uri} failed: ${(e as Error).message}`);
+            }
+        });
+    };
+    ctx.scheduleReissue = scheduleReissue;
     client.sendNotification = function (this: any, ...args: any[]) {
         if (!ctx.isEnabled()) return origNotify(...args);
         const method = methodOf(args[0]);
         if (!method) return origNotify(...args);
-        const newParams = handleOutgoingNotification(method, args[1], ctx);
+        const newParams = handleOutgoingNotification(method, args[1], ctx, scheduleReissue);
         const newArgs = args.slice();
         newArgs[1] = newParams;
         return origNotify(...newArgs);

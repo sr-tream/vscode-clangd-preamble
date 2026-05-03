@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Graph } from './graph';
 import { StateStore } from './preamble';
-import { installHooks, InstallContext } from './middleware';
+import { installHooks, InstallContext, resolvePendingNow, _pendingUris } from './middleware';
 
 const CLANGD_EXTENSION_ID = 'llvm-vs-code-extensions.vscode-clangd';
 const CFG_NS = 'clangd-preamble';
@@ -126,21 +126,38 @@ class PreambleStatus implements vscode.Disposable {
     private refresh(): void {
         const editor = vscode.window.activeTextEditor;
         if (!editor || !installCtx.isEnabled()) { this.item.hide(); return; }
-        const st = store.get(editor.document.uri.toString());
-        if (!st || !st.active) { this.item.hide(); return; }
-        const tuName = path.basename(st.includerTu);
-        this.item.text = `$(file-symlink-file) Preamble: ${tuName}`;
-        const md = new vscode.MarkdownString(
-            `**clangd-preamble active**\n\n` +
-            `- Includer TU: \`${st.includerTu}\`\n` +
-            `- Preamble lines: \`${st.preambleLines}\`\n` +
-            `- Direct include: \`${st.includerDirect}\`\n` +
-            `- Suppressed diagnostics: \`${st.droppedDiags.length}\`\n\n` +
-            `[Refresh](command:clangd-preamble.refresh) · [Disable for this file](command:clangd-preamble.disableBuf)`,
-        );
-        md.isTrusted = true;
-        this.item.tooltip = md;
-        this.item.show();
+        const uri = editor.document.uri.toString();
+        const st = store.get(uri);
+        if (st && st.active) {
+            const tuName = path.basename(st.includerTu);
+            this.item.text = `$(file-symlink-file) Preamble: ${tuName}`;
+            const md = new vscode.MarkdownString(
+                `**clangd-preamble active**\n\n` +
+                `- Includer TU: \`${st.includerTu}\`\n` +
+                `- Preamble lines: \`${st.preambleLines}\`\n` +
+                `- Direct include: \`${st.includerDirect}\`\n` +
+                `- Suppressed diagnostics: \`${st.droppedDiags.length}\`\n\n` +
+                `[Refresh](command:clangd-preamble.refresh) · [Disable for this file](command:clangd-preamble.disableBuf)`,
+            );
+            md.isTrusted = true;
+            this.item.tooltip = md;
+            this.item.show();
+            return;
+        }
+        if (_pendingUris().includes(uri)) {
+            this.item.text = `$(watch) Preamble: pending`;
+            const md = new vscode.MarkdownString(
+                `**clangd-preamble waiting for includer**\n\n` +
+                `No translation unit including this header has been observed yet.\n` +
+                `Open the corresponding \`.cpp\` (or run **Scan Project for Includer TUs**) and the preamble will be injected automatically.\n\n` +
+                `[Refresh](command:clangd-preamble.refresh) · [Scan Project](command:clangd-preamble.scanProject)`,
+            );
+            md.isTrusted = true;
+            this.item.tooltip = md;
+            this.item.show();
+            return;
+        }
+        this.item.hide();
     }
 
     dispose(): void { this.subs.forEach((s) => s.dispose()); }
@@ -209,8 +226,11 @@ async function cmdEnableBuf(): Promise<void> {
 }
 
 function cmdDumpGraph(): void {
-    const text = graph.dump();
-    showInOutput('Include Graph', text);
+    const lines = [graph.dump(), ''];
+    const pending = _pendingUris();
+    lines.push(`Pending headers (awaiting includer): ${pending.length}`);
+    for (const u of pending) lines.push(`  ${u}`);
+    showInOutput('Include Graph', lines.join('\n'));
 }
 
 function cmdDumpState(): void {
@@ -274,8 +294,10 @@ async function cmdScanProject(): Promise<void> {
             }
         },
     );
+    const resolved = resolvePendingNow(installCtx);
+    const tail = resolved > 0 ? ` · resolved ${resolved} pending header(s)` : '';
     vscode.window.showInformationMessage(
-        `clangd-preamble: observed ${total} TU(s) across ${folders.length} workspace folder(s)`,
+        `clangd-preamble: observed ${total} TU(s) across ${folders.length} workspace folder(s)${tail}`,
     );
 }
 
