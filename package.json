@@ -15,7 +15,7 @@
     "homepage": "https://github.com/sr-tream/vscode-clangd-preamble#readme",
     "displayName": "clangd Non-Self-Contained Header Hook",
     "description": "Make non-self-contained C/C++ headers parse cleanly under clangd by injecting a fake preamble from a recently-seen includer TU and remapping positions across LSP traffic.",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "engines": {
         "vscode": "^1.75.0"
     },

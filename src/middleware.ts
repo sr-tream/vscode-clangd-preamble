@@ -51,7 +51,7 @@ function methodOf(x: any): string | undefined {
 // Headers opened before any includer TU is known. Keyed by URI; value is the
 // original didOpen.textDocument so we can replay it once the graph gains a
 // matching TU.
-export interface PendingHeader { uri: string; languageId: string; version: number; text: string; }
+export interface PendingHeader { uri: string; languageId: string; version: number; text: string; waitForTuReady?: string; }
 const pendingHeaders = new Map<string, PendingHeader>();
 export function _pendingCount(): number { return pendingHeaders.size; }
 export function _pendingUris(): string[] { return Array.from(pendingHeaders.keys()); }
@@ -71,6 +71,12 @@ export function clearForced(uri: string): void { forcedUris.delete(uri); }
 // disk-read companion gets re-evaluated when the user finally opens the
 // source. Cleared on `didClose` for the TU.
 const tusObservedFromEditor = new Set<string>();
+
+// TUs whose first diagnostics have arrived from clangd. `syncOpenDocs` can see
+// an editor-open TU before clangd has finished building its preamble. Delaying
+// synthetic headers that depend on that TU avoids poisoning the TU parse with
+// the modified open header contents during startup.
+const tusReady = new Set<string>();
 
 function uriToFsPath(uri: string): string {
     try { return vscode.Uri.parse(uri).fsPath; } catch { return uri; }
@@ -112,6 +118,22 @@ function promoteVirtualTu(tuPath: string): boolean {
 function demoteToVirtual(tuPath: string, uri: string): void {
     if (virtualTus.has(tuPath)) return;
     virtualTus.set(tuPath, { uri, pchReady: true });
+}
+
+function isTuReadyForPreamble(tuPath: string): boolean {
+    if (tusObservedFromEditor.has(tuPath)) return tusReady.has(tuPath);
+    const vt = virtualTus.get(tuPath);
+    return !vt || vt.pchReady;
+}
+
+function rememberPendingHeader(
+    h: PendingHeader,
+    ctx: InstallContext,
+    reason: string,
+): void {
+    pendingHeaders.set(h.uri, h);
+    ctx.onStateChange?.(h.uri);
+    ctx.log(`${reason} (queue=${pendingHeaders.size})`);
 }
 
 // ===== Outgoing param shifts =====
@@ -505,36 +527,57 @@ function handleOutgoingNotification(
             const force = forcedUris.delete(td.uri);
             const includer = ctx.graph.findIncluder(path, { force });
             if (includer) {
+                // Open companion virtually if not already live so clangd builds its PCH.
+                // If the source is already open in the editor, wait until clangd has
+                // actually parsed it before sending modified header contents.
+                const openInEditorDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === includer.tuPath);
+                if (openInEditorDoc && !tusObservedFromEditor.has(includer.tuPath)) {
+                    tusObservedFromEditor.add(includer.tuPath);
+                    tusReady.delete(includer.tuPath);
+                    ctx.graph.observeTu(includer.tuPath, openInEditorDoc.getText());
+                    origNotify('textDocument/didChange', {
+                        textDocument: { uri: openInEditorDoc.uri.toString(), version: openInEditorDoc.version },
+                        contentChanges: [{ text: openInEditorDoc.getText() }],
+                    });
+                    ctx.log(`didOpen header ${path}: requested readiness parse for already-open includer ${includer.tuPath}`);
+                }
+                if (!tusObservedFromEditor.has(includer.tuPath) && !virtualTus.has(includer.tuPath)) {
+                    if (!openInEditorDoc) {
+                        openTuVirtually(origNotify, includer.tuPath);
+                        ctx.log(`didOpen header ${path}: opening companion ${includer.tuPath} virtually for PCH`);
+                    }
+                }
+                if (!isTuReadyForPreamble(includer.tuPath)) {
+                    rememberPendingHeader({
+                        uri: td.uri,
+                        languageId: td.languageId,
+                        version: td.version ?? 0,
+                        text: td.text ?? '',
+                        waitForTuReady: includer.tuPath,
+                    }, ctx, `didOpen header ${path}: includer ${includer.tuPath} not ready, delaying preamble`);
+                    return params;
+                }
                 const st = buildState(path, td.uri, td.text, includer, ctx.marker());
                 ctx.store.set(td.uri, st);
                 pendingHeaders.delete(td.uri);
                 ctx.onStateChange?.(td.uri);
                 ctx.log(`didOpen header ${path}: preamble ${st.preambleLines} lines from ${includer.tuPath} (direct=${includer.direct})`);
-                // Open companion virtually if not already live so clangd builds its PCH
-                if (!tusObservedFromEditor.has(includer.tuPath) && !virtualTus.has(includer.tuPath)) {
-                    const isOpenInEditor = vscode.workspace.textDocuments.some(d => d.uri.fsPath === includer.tuPath);
-                    if (!isOpenInEditor) {
-                        openTuVirtually(origNotify, includer.tuPath);
-                        ctx.log(`didOpen header ${path}: opening companion ${includer.tuPath} virtually for PCH`);
-                    }
-                }
                 const copy = deepCopy(params);
                 copy.textDocument.text = st.preambleText + (copy.textDocument.text ?? '');
                 return copy;
             } else {
-                pendingHeaders.set(td.uri, {
+                rememberPendingHeader({
                     uri: td.uri,
                     languageId: td.languageId,
                     version: td.version ?? 0,
                     text: td.text ?? '',
-                });
-                ctx.onStateChange?.(td.uri);
-                ctx.log(`didOpen header ${path}: no includer found, marked pending (queue=${pendingHeaders.size})`);
+                }, ctx, `didOpen header ${path}: no includer found, marked pending`);
             }
         } else if (isTuPath(path) && typeof td.text === 'string') {
             const alreadyOpen = promoteVirtualTu(path);
             const firstEditorObservation = !tusObservedFromEditor.has(path);
             tusObservedFromEditor.add(path);
+            tusReady.delete(path);
             ctx.graph.observeTu(path, td.text);
             ctx.log(`didOpen TU ${path}: observed ${td.text.length} bytes (pending headers: ${pendingHeaders.size}, first-editor=${firstEditorObservation}, promoted=${alreadyOpen})`);
             // Promotion does disk I/O for every pending header (findIncluder +
@@ -543,11 +586,19 @@ function handleOutgoingNotification(
             if (pendingHeaders.size > 0 || firstEditorObservation) {
                 setImmediate(() => {
                     tryResolvePending(ctx, scheduleReissue);
-                    if (firstEditorObservation) refreshActiveHeadersForTu(ctx, scheduleReissue, path);
                 });
             }
-            // clangd already has this file open via virtual open; suppress the duplicate didOpen
-            if (alreadyOpen) return SUPPRESS;
+            // clangd already has this file open via virtual open. Suppress the
+            // duplicate didOpen, but first sync the real editor text so clangd
+            // stops using the disk snapshot opened for the companion PCH.
+            if (alreadyOpen) {
+                origNotify('textDocument/didChange', {
+                    textDocument: { uri: td.uri, version: td.version ?? 0 },
+                    contentChanges: [{ text: td.text }],
+                });
+                ctx.log(`didOpen TU ${path}: synced promoted virtual TU from editor text`);
+                return SUPPRESS;
+            }
         }
         return params;
     }
@@ -565,12 +616,16 @@ function handleOutgoingNotification(
         }
         const path = uriToFsPath(uri);
         if (isTuPath(path)) {
-            ctx.graph.invalidate(path);
-            // Re-observe with the dirty buffer text would need the full text here;
-            // didChange only carries deltas. Defer fresh observation to disk read on
-            // demand via tryResolvePending (which calls findIncluder, which falls back
-            // to observeTuFromDisk via the companion path when a basename match is
-            // missing). Worst case: next didOpen of this TU re-observes.
+            tusReady.delete(path);
+            const fullTextChange = Array.isArray(params.contentChanges)
+                && params.contentChanges.length === 1
+                && !params.contentChanges[0].range
+                && typeof params.contentChanges[0].text === 'string';
+            if (fullTextChange) {
+                ctx.graph.observeTu(path, params.contentChanges[0].text);
+            } else {
+                ctx.graph.invalidate(path);
+            }
         }
         // Also pending headers might track this changed buffer.
         return result;
@@ -584,6 +639,7 @@ function handleOutgoingNotification(
             if (had) ctx.onStateChange?.(uri);
             if (isTuPath(fsPath)) {
                 tusObservedFromEditor.delete(fsPath);
+                tusReady.delete(fsPath);
                 // If any active header still uses this TU as its includer,
                 // keep it open in clangd virtually — header diagnostics depend
                 // on the companion's PCH, which clangd would drop on didClose.
@@ -619,7 +675,10 @@ function handleOutgoingNotification(
             const changedTus = new Set<string>(Object.keys(changes));
             if (changedTus.size > 0) {
                 ctx.log(`workspace/didChangeConfiguration: ${changedTus.size} TU flag entries`);
-                setImmediate(() => refreshHeadersForFlagChange(ctx, scheduleReissue, changedTus));
+                setImmediate(() => {
+                    refreshVirtualTusForFlagChange(ctx, origNotify, changedTus);
+                    refreshHeadersForFlagChange(ctx, scheduleReissue, changedTus);
+                });
             }
         }
         return params;
@@ -644,7 +703,13 @@ function tryResolvePending(
         const ready: PendingHeader[] = [];
         for (const [uri, h] of pendingHeaders) {
             const path = uriToFsPath(uri);
-            if (ctx.graph.findIncluder(path)) ready.push(h);
+            const includer = ctx.graph.findIncluder(path);
+            if (includer && isTuReadyForPreamble(includer.tuPath)) {
+                ready.push(h);
+            } else if (includer && h.waitForTuReady !== includer.tuPath) {
+                h.waitForTuReady = includer.tuPath;
+                ctx.log(`pending header ${path}: includer ${includer.tuPath} not ready yet`);
+            }
         }
         for (const h of ready) {
             pendingHeaders.delete(h.uri);
@@ -659,7 +724,18 @@ function tryResolvePending(
         if (pendingHeaders.has(uri)) continue;
         const fsPath = doc.uri.fsPath;
         if (!isHeaderPath(fsPath)) continue;
-        if (!ctx.graph.findIncluder(fsPath)) continue;
+        const includer = ctx.graph.findIncluder(fsPath);
+        if (!includer) continue;
+        if (!isTuReadyForPreamble(includer.tuPath)) {
+            rememberPendingHeader({
+                uri,
+                languageId: doc.languageId,
+                version: doc.version,
+                text: doc.getText(),
+                waitForTuReady: includer.tuPath,
+            }, ctx, `untracked header ${fsPath}: includer ${includer.tuPath} not ready, delaying preamble`);
+            continue;
+        }
         ctx.log(`untracked header ${fsPath}: includer now available, replaying didOpen`);
         scheduleReissue({
             uri,
@@ -678,12 +754,19 @@ function tryResolvePending(
 function syncOpenDocs(
     ctx: InstallContext,
     scheduleReissue: (h: PendingHeader) => void,
+    client: MutableLanguageClient,
 ): void {
     for (const doc of vscode.workspace.textDocuments) {
         const fsPath = doc.uri.fsPath;
         if (isTuPath(fsPath)) {
             tusObservedFromEditor.add(fsPath);
+            tusReady.delete(fsPath);
             ctx.graph.observeTu(fsPath, doc.getText());
+            client.sendNotification('textDocument/didChange', {
+                textDocument: { uri: doc.uri.toString(), version: doc.version },
+                contentChanges: [{ text: doc.getText() }],
+            });
+            ctx.log(`syncOpenDocs TU ${fsPath}: requested clangd readiness parse`);
         }
     }
     tryResolvePending(ctx, scheduleReissue);
@@ -700,6 +783,7 @@ function refreshActiveHeadersForTu(
     scheduleReissue: (h: PendingHeader) => void,
     observedTu: string,
 ): void {
+    if (!isTuReadyForPreamble(observedTu)) return;
     for (const doc of vscode.workspace.textDocuments) {
         const uri = doc.uri.toString();
         const st = ctx.store.get(uri);
@@ -718,6 +802,23 @@ function refreshActiveHeadersForTu(
     }
 }
 
+// Reopen virtual companions whose compile flags changed. clangd doesn't
+// necessarily reparse already-open files after the vscode-clangd configuration
+// extension updates its in-memory CDB, and virtual TU diagnostics are hidden, so
+// force a close/open cycle to rebuild the companion parse with current flags.
+function refreshVirtualTusForFlagChange(
+    ctx: InstallContext,
+    origNotify: (...args: any[]) => any,
+    changedTus: Set<string>,
+): void {
+    for (const tuPath of changedTus) {
+        if (!virtualTus.has(tuPath)) continue;
+        closeTuVirtually(origNotify, tuPath);
+        openTuVirtually(origNotify, tuPath);
+        ctx.log(`virtual TU ${tuPath}: flags changed, replaying virtual didOpen`);
+    }
+}
+
 // Replay `didOpen` for active headers whose includer TU is in `changedTus`
 // (the keys of the `compilationDatabaseChanges` clangd extension). Triggered
 // from a `workspace/didChangeConfiguration` interceptor so headers parsed
@@ -732,6 +833,10 @@ function refreshHeadersForFlagChange(
         const st = ctx.store.get(uri);
         if (!st || !st.active) continue;
         if (!changedTus.has(st.includerTu)) continue;
+        if (!isTuReadyForPreamble(st.includerTu)) {
+            ctx.log(`active header ${doc.uri.fsPath}: includer TU ${st.includerTu} flags changed but is not ready yet`);
+            continue;
+        }
         const fsPath = doc.uri.fsPath;
         if (!isHeaderPath(fsPath)) continue;
         ctx.log(`active header ${fsPath}: includer TU ${st.includerTu} flags changed, replaying didOpen`);
@@ -771,11 +876,31 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
         // Virtual TU PCH-ready: first publishDiagnostics for the companion means
         // its PCH is built; re-analyze any header that opened before it was ready.
         const diagFsPath = uri.fsPath;
-        const diagVt = virtualTus.get(diagFsPath);
-        if (diagVt && !diagVt.pchReady) {
-            diagVt.pchReady = true;
+        if (isTuPath(diagFsPath) && tusObservedFromEditor.has(diagFsPath) && !tusReady.has(diagFsPath)) {
+            tusReady.add(diagFsPath);
+            ctx.log(`publishDiagnostics TU ${uri.toString()}: marked includer ready (${diagnostics.length} diagnostics)`);
             const sr = ctx.scheduleReissue;
-            if (sr) setImmediate(() => refreshActiveHeadersForTu(ctx, sr, diagFsPath));
+            if (sr) {
+                setImmediate(() => {
+                    tryResolvePending(ctx, sr);
+                    refreshActiveHeadersForTu(ctx, sr, diagFsPath);
+                });
+            }
+        }
+        const diagVt = virtualTus.get(diagFsPath);
+        if (diagVt) {
+            if (!diagVt.pchReady) {
+                diagVt.pchReady = true;
+                const sr = ctx.scheduleReissue;
+                if (sr) {
+                    setImmediate(() => {
+                        tryResolvePending(ctx, sr);
+                        refreshActiveHeadersForTu(ctx, sr, diagFsPath);
+                    });
+                }
+            }
+            ctx.log(`publishDiagnostics virtual TU ${uri.toString()}: ${diagnostics.length} → 0 (dropped virtual companion diagnostics)`);
+            return (prevDiag ?? next)(uri, [], next);
         }
 
         const uriStr = uri.toString();
@@ -934,7 +1059,7 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
     } as any;
 
     // Catch up with documents already opened pre-wrap.
-    queueMicrotask(() => syncOpenDocs(ctx, scheduleReissue));
+    queueMicrotask(() => syncOpenDocs(ctx, scheduleReissue, client));
 
     return true;
 }
