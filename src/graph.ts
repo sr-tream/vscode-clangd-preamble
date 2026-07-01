@@ -24,6 +24,12 @@ export interface IncluderPick {
     direct: boolean;
 }
 
+export interface IncluderCandidate extends IncluderPick {
+    includeIndex: number;
+    observedOrder: number;
+    companion: boolean;
+}
+
 const HEADER_EXTS = new Set(['.h', '.hh', '.hpp', '.hxx', '.inl', '.inc', '.ipp', '.tcc', '.tpp']);
 const TU_EXTS = new Set(['.cpp', '.cc', '.cxx', '.c', '.C', '.mm']);
 
@@ -36,6 +42,7 @@ export function isTuPath(p: string): boolean {
 
 export interface FindIncluderOptions {
     force?: boolean;
+    preferredTu?: string;
 }
 
 export class Graph {
@@ -105,35 +112,63 @@ export class Graph {
         return undefined;
     }
 
-    // Pick the TU with the SHORTEST prefix-before-this-header. A polluting
-    // includer (e.g. CEF wrapper that puts common.h after several framework
-    // headers) would inject macros that conflict with the header's own
-    // includes — pick the most "neutral" TU instead. Tie-break: most recent
-    // observation.
-    private pickIncluderTu(headerPath: string): string | undefined {
+    private observedCandidateTus(headerPath: string): string[] {
         const bn = path.basename(headerPath);
         const candidates = this.headerUsers.get(bn);
-        if (candidates && candidates.size > 0) {
-            let best: string | undefined;
-            let bestPos = Infinity;
-            let bestMt = -1;
-            for (const tu of candidates) {
-                const tuInc = this.tuIncludes.get(tu);
-                if (!tuInc) continue;
-                let pos = tuInc.length;
-                for (let i = 0; i < tuInc.length; i++) {
-                    if (path.basename(tuInc[i].name) === bn) { pos = i; break; }
-                }
-                const mt = this.tuMtime.get(tu) ?? 0;
-                if (pos < bestPos || (pos === bestPos && mt > bestMt)) {
-                    best = tu; bestPos = pos; bestMt = mt;
-                }
-            }
-            if (best) return best;
+        if (!candidates) return [];
+        return Array.from(candidates).filter(tu => this.tuIncludes.has(tu));
+    }
+
+    private includeIndex(tuPath: string, headerBasename: string): number {
+        const tuInc = this.tuIncludes.get(tuPath);
+        if (!tuInc) return Infinity;
+        for (let i = 0; i < tuInc.length; i++) {
+            if (path.basename(tuInc[i].name) === headerBasename) return i;
         }
+        return tuInc.length;
+    }
+
+    private candidateFromTu(
+        tuPath: string,
+        headerPath: string,
+        companion: boolean,
+    ): IncluderCandidate | undefined {
+        const headerBasename = path.basename(headerPath);
+        const root = this.projectRootForTu(tuPath);
+        const built = this.buildPrefix(tuPath, headerBasename, root);
+        if (!built || built.lines.length === 0) return undefined;
+        return {
+            tuPath,
+            prefixLines: built.lines,
+            direct: built.direct,
+            includeIndex: this.includeIndex(tuPath, headerBasename),
+            observedOrder: this.tuMtime.get(tuPath) ?? 0,
+            companion,
+        };
+    }
+
+    private sortCandidates(candidates: IncluderCandidate[]): IncluderCandidate[] {
+        return candidates.sort((a, b) => {
+            if (a.includeIndex !== b.includeIndex) return a.includeIndex - b.includeIndex;
+            if (a.observedOrder !== b.observedOrder) return b.observedOrder - a.observedOrder;
+            return a.tuPath.localeCompare(b.tuPath);
+        });
+    }
+
+    private companionCandidate(headerPath: string): IncluderCandidate | undefined {
         const comp = this.companionTu(headerPath);
-        if (comp && this.observeTuFromDisk(comp)) return comp;
-        return undefined;
+        if (!comp) return undefined;
+        if (!this.tuIncludes.has(comp) && !this.observeTuFromDisk(comp)) return undefined;
+        return this.candidateFromTu(comp, headerPath, true);
+    }
+
+    private observedCandidates(headerPath: string): IncluderCandidate[] {
+        const out: IncluderCandidate[] = [];
+        for (const tu of this.observedCandidateTus(headerPath)) {
+            const candidate = this.candidateFromTu(tu, headerPath, false);
+            if (candidate) out.push(candidate);
+        }
+        return this.sortCandidates(out);
     }
 
     // Walk root recursively for a file matching `basename`. Cached per-basename
@@ -255,12 +290,32 @@ export class Graph {
 
     findIncluder(headerPath: string, options: FindIncluderOptions = {}): IncluderPick | undefined {
         if (!options.force && this.headerIsSelfContained(headerPath)) return undefined;
-        const tu = this.pickIncluderTu(headerPath);
-        if (!tu) return undefined;
-        const root = this.projectRootForTu(tu);
-        const built = this.buildPrefix(tu, path.basename(headerPath), root);
-        if (!built || built.lines.length === 0) return undefined;
-        return { tuPath: tu, prefixLines: built.lines, direct: built.direct };
+        if (options.preferredTu) {
+            const preferred = this.listIncluders(headerPath, { force: true })
+                .find(c => c.tuPath === options.preferredTu);
+            if (preferred) return preferred;
+        }
+        const observed = this.observedCandidates(headerPath);
+        if (observed.length > 0) return observed[0];
+        return this.companionCandidate(headerPath);
+    }
+
+    findRecentIncluder(headerPath: string, options: FindIncluderOptions = {}): IncluderPick | undefined {
+        if (!options.force && this.headerIsSelfContained(headerPath)) return undefined;
+        const observed = this.observedCandidates(headerPath).sort((a, b) => {
+            if (a.observedOrder !== b.observedOrder) return b.observedOrder - a.observedOrder;
+            if (a.includeIndex !== b.includeIndex) return a.includeIndex - b.includeIndex;
+            return a.tuPath.localeCompare(b.tuPath);
+        });
+        return observed[0];
+    }
+
+    listIncluders(headerPath: string, options: FindIncluderOptions = {}): IncluderCandidate[] {
+        if (!options.force && this.headerIsSelfContained(headerPath)) return [];
+        const out = this.observedCandidates(headerPath);
+        const comp = this.companionCandidate(headerPath);
+        if (comp && !out.some(c => c.tuPath === comp.tuPath)) out.push(comp);
+        return this.sortCandidates(out);
     }
 
     scanProject(root: string): number {

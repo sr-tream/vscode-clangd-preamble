@@ -1,10 +1,12 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { Graph, isHeaderPath } from './graph';
+import { Graph, isHeaderPath, isTuPath } from './graph';
 import { StateStore } from './preamble';
 import {
     installHooks, InstallContext, resolvePendingNow, _pendingUris,
     markForced, markDisabled, clearDisabled, isDisabled,
+    setPreferredIncluder, setRecentIncluderMode, clearPreferredIncluder,
+    getPreferredIncluder, isRecentIncluderMode, markTuReadyForPreamble,
 } from './middleware';
 
 const CLANGD_EXTENSION_ID = 'llvm-vs-code-extensions.vscode-clangd';
@@ -21,6 +23,11 @@ interface MutableLanguageClient {
 }
 interface ClangdApiV1 { languageClient: MutableLanguageClient | undefined; }
 interface ClangdExtension { getApi(version: 1): ClangdApiV1; }
+interface IncluderQuickPickItem extends vscode.QuickPickItem {
+    tuPath?: string;
+    auto?: boolean;
+    recent?: boolean;
+}
 
 let logChannel: vscode.OutputChannel | undefined;
 function log(message: string): void {
@@ -55,6 +62,7 @@ const installCtx: InstallContext = {
 
 let attachedClient: MutableLanguageClient | undefined;
 let stateSub: vscode.Disposable | undefined;
+let lastActiveTuPath: string | undefined;
 
 const REATTACH_POLL_MS = 200;
 const REATTACH_MAX_ATTEMPTS = 50;
@@ -116,7 +124,10 @@ class PreambleStatus implements vscode.Disposable {
 
         this.subs.push(
             this.item,
-            vscode.window.onDidChangeActiveTextEditor(() => this.refresh()),
+            vscode.window.onDidChangeActiveTextEditor((editor) => {
+                void handleActiveEditorChange(editor).finally(() => this.refresh());
+                this.refresh();
+            }),
             vscode.workspace.onDidCloseTextDocument(() => this.refresh()),
             stateChangeEmitter.event(() => this.refresh()),
             vscode.workspace.onDidChangeConfiguration((e) => {
@@ -146,15 +157,21 @@ class PreambleStatus implements vscode.Disposable {
         }
         if (st && st.active) {
             const tuName = path.basename(st.includerTu);
-            this.item.command = 'clangd-preamble.refresh';
+            const selection = getPreferredIncluder(uri)
+                ? 'fixed'
+                : isRecentIncluderMode(uri) ? 'last seen' : 'auto';
+            this.item.command = 'clangd-preamble.selectIncluder';
             this.item.text = `$(file-symlink-file) Preamble: ${tuName}`;
             const md = new vscode.MarkdownString(
                 `**clangd-preamble active**\n\n` +
                 `- Includer TU: \`${st.includerTu}\`\n` +
+                `- Selection: \`${selection}\`\n` +
                 `- Preamble lines: \`${st.preambleLines}\`\n` +
                 `- Direct include: \`${st.includerDirect}\`\n` +
                 `- Suppressed diagnostics: \`${st.droppedDiags.length}\`\n\n` +
-                `[Refresh](command:clangd-preamble.refresh) · [Disable for this file](command:clangd-preamble.disableBuf)`,
+                `[Select includer](command:clangd-preamble.selectIncluder) · ` +
+                `[Refresh](command:clangd-preamble.refresh) · ` +
+                `[Disable for this file](command:clangd-preamble.disableBuf)`,
             );
             md.isTrusted = true;
             this.item.tooltip = md;
@@ -206,6 +223,75 @@ function activeHeaderDoc(): vscode.TextDocument | undefined {
     return ed.document;
 }
 
+function workspaceRelative(fsPath: string): string {
+    const uri = vscode.Uri.file(fsPath);
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (!folder) return fsPath;
+    const rel = path.relative(folder.uri.fsPath, fsPath);
+    return rel.length > 0 ? rel : path.basename(fsPath);
+}
+
+function observeTuDocument(doc: vscode.TextDocument, reason: string): string | undefined {
+    const fsPath = doc.uri.fsPath;
+    if (!isTuPath(fsPath)) return undefined;
+    graph.observeTu(fsPath, doc.getText());
+    markTuReadyForPreamble(installCtx, fsPath, `active editor ${reason}`);
+    log(`active TU ${fsPath}: marked last seen from ${reason}`);
+    return fsPath;
+}
+
+function observeLastActiveTu(): string | undefined {
+    if (!lastActiveTuPath) return undefined;
+    const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === lastActiveTuPath);
+    if (!doc) return undefined;
+    return observeTuDocument(doc, 'editor leave');
+}
+
+async function reissueRecentHeaderIfChanged(doc: vscode.TextDocument): Promise<boolean> {
+    if (!attachedClient) return false;
+    if (!isHeaderPath(doc.uri.fsPath)) return false;
+    const uri = doc.uri.toString();
+    if (!isRecentIncluderMode(uri)) return false;
+    const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
+    if (!recent) return false;
+    if (store.get(uri)?.includerTu === recent.tuPath) return false;
+    markForced(uri);
+    await reissueDidOpen(attachedClient, doc);
+    return true;
+}
+
+async function reissueRecentHeadersForTu(tuPath: string): Promise<void> {
+    if (!attachedClient) return;
+    for (const doc of vscode.workspace.textDocuments) {
+        if (!isHeaderPath(doc.uri.fsPath)) continue;
+        if (!isRecentIncluderMode(doc.uri.toString())) continue;
+        const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
+        if (!recent || recent.tuPath !== tuPath) continue;
+        await reissueRecentHeaderIfChanged(doc);
+    }
+}
+
+async function handleActiveEditorChange(editor: vscode.TextEditor | undefined): Promise<void> {
+    const leftTuPath = observeLastActiveTu();
+    const doc = editor?.document;
+    if (!doc || !installCtx.isEnabled()) {
+        lastActiveTuPath = undefined;
+        return;
+    }
+
+    const fsPath = doc.uri.fsPath;
+    if (isTuPath(fsPath)) {
+        const activeTuPath = observeTuDocument(doc, 'editor focus');
+        lastActiveTuPath = activeTuPath;
+        if (activeTuPath) await reissueRecentHeadersForTu(activeTuPath);
+        return;
+    }
+
+    lastActiveTuPath = undefined;
+    if (leftTuPath) await reissueRecentHeadersForTu(leftTuPath);
+    await reissueRecentHeaderIfChanged(doc);
+}
+
 async function cmdRefresh(): Promise<void> {
     const doc = activeHeaderDoc();
     if (!doc || !attachedClient) return;
@@ -226,6 +312,79 @@ async function cmdRefresh(): Promise<void> {
         );
     } else {
         vscode.window.showWarningMessage('clangd-preamble: no includer found for current file');
+    }
+}
+
+async function cmdSelectIncluder(): Promise<void> {
+    const doc = activeHeaderDoc();
+    if (!doc || !attachedClient) return;
+    if (!isHeaderPath(doc.uri.fsPath)) {
+        vscode.window.showWarningMessage('clangd-preamble: current file is not a header');
+        return;
+    }
+
+    const uri = doc.uri.toString();
+    const current = store.get(uri)?.includerTu;
+    const preferred = getPreferredIncluder(uri);
+    const recentMode = isRecentIncluderMode(uri);
+    const candidates = graph.listIncluders(doc.uri.fsPath, { force: true });
+    if (candidates.length === 0) {
+        vscode.window.showWarningMessage('clangd-preamble: no includer candidates found for current file');
+        return;
+    }
+
+    const auto = graph.findIncluder(doc.uri.fsPath, { force: true });
+    const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
+    const items: IncluderQuickPickItem[] = [{
+        label: `${!preferred && !recentMode ? '$(check) ' : ''}Auto-select best includer`,
+        description: auto ? workspaceRelative(auto.tuPath) : undefined,
+        detail: auto
+            ? `${auto.prefixLines.length} preamble line(s), direct=${auto.direct}`
+            : 'Use the default shortest-prefix heuristic',
+        auto: true,
+    }, {
+        label: `${recentMode ? '$(check) ' : ''}Use last seen includer`,
+        description: recent ? workspaceRelative(recent.tuPath) : undefined,
+        detail: recent
+            ? `${recent.prefixLines.length} preamble line(s), direct=${recent.direct}`
+            : 'Use the most recently observed source that can include this header',
+        recent: true,
+    }];
+
+    for (const c of candidates) {
+        const selected = preferred === c.tuPath;
+        const currentSuffix = c.tuPath === current ? ', current' : '';
+        items.push({
+            label: `${selected ? '$(check) ' : ''}${path.basename(c.tuPath)}`,
+            description: workspaceRelative(c.tuPath),
+            detail: `${c.prefixLines.length} preamble line(s), include #${c.includeIndex + 1}, direct=${c.direct}${c.companion ? ', companion' : ''}${currentSuffix}`,
+            tuPath: c.tuPath,
+        });
+    }
+
+    const picked = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select preamble source translation unit',
+        matchOnDescription: true,
+        matchOnDetail: true,
+    });
+    if (!picked) return;
+
+    clearDisabled(uri);
+    if (picked.auto) {
+        clearPreferredIncluder(uri);
+    } else if (picked.recent) {
+        setRecentIncluderMode(uri);
+    } else if (picked.tuPath) {
+        setPreferredIncluder(uri, picked.tuPath);
+    }
+    markForced(uri);
+    await reissueDidOpen(attachedClient, doc);
+
+    const st = store.get(uri);
+    if (st) {
+        vscode.window.showInformationMessage(
+            `clangd-preamble: using ${path.basename(st.includerTu)} (${st.preambleLines} lines)`,
+        );
     }
 }
 
@@ -370,6 +529,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }),
         vscode.commands.registerCommand('clangd-preamble.reattach', () => cmdReattach(ext)),
         vscode.commands.registerCommand('clangd-preamble.refresh', cmdRefresh),
+        vscode.commands.registerCommand('clangd-preamble.selectIncluder', cmdSelectIncluder),
         vscode.commands.registerCommand('clangd-preamble.disableBuf', cmdDisableBuf),
         vscode.commands.registerCommand('clangd-preamble.enableBuf', cmdEnableBuf),
         vscode.commands.registerCommand('clangd-preamble.dumpGraph', cmdDumpGraph),
@@ -377,6 +537,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('clangd-preamble.dumpDroppedDiagnostics', cmdDumpDroppedDiagnostics),
         vscode.commands.registerCommand('clangd-preamble.scanProject', cmdScanProject),
     );
+
+    void handleActiveEditorChange(vscode.window.activeTextEditor);
 }
 
 export function deactivate(): void {

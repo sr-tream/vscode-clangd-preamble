@@ -63,12 +63,36 @@ const forcedUris = new Set<string>();
 export function markForced(uri: string): void { forcedUris.add(uri); }
 export function clearForced(uri: string): void { forcedUris.delete(uri); }
 
+// Sticky per-buffer includer override chosen from the status-bar selector.
+// It survives reissue cycles until the user switches back to auto or disables
+// the header.
+const preferredIncluders = new Map<string, string>();
+const recentIncluderUris = new Set<string>();
+export function setPreferredIncluder(uri: string, tuPath: string): void {
+    preferredIncluders.set(uri, tuPath);
+    recentIncluderUris.delete(uri);
+    disabledUris.delete(uri);
+}
+export function setRecentIncluderMode(uri: string): void {
+    recentIncluderUris.add(uri);
+    preferredIncluders.delete(uri);
+    disabledUris.delete(uri);
+}
+export function clearPreferredIncluder(uri: string): void {
+    preferredIncluders.delete(uri);
+    recentIncluderUris.delete(uri);
+}
+export function getPreferredIncluder(uri: string): string | undefined { return preferredIncluders.get(uri); }
+export function isRecentIncluderMode(uri: string): boolean { return recentIncluderUris.has(uri); }
+
 // Per-buffer opt-out. A disabled header must survive didClose+didOpen replays
 // used by commands, otherwise Disable immediately reopens and injects again.
 const disabledUris = new Set<string>();
 export function markDisabled(uri: string): void {
     disabledUris.add(uri);
     forcedUris.delete(uri);
+    preferredIncluders.delete(uri);
+    recentIncluderUris.delete(uri);
     pendingHeaders.delete(uri);
 }
 export function clearDisabled(uri: string): void { disabledUris.delete(uri); }
@@ -145,6 +169,37 @@ function rememberPendingHeader(
     pendingHeaders.set(h.uri, h);
     ctx.onStateChange?.(h.uri);
     ctx.log(`${reason} (queue=${pendingHeaders.size})`);
+}
+
+function findHeaderIncluder(
+    ctx: InstallContext,
+    headerPath: string,
+    headerUri: string,
+    force = false,
+): ReturnType<Graph['findIncluder']> {
+    const preferredTu = preferredIncluders.get(headerUri);
+    if (preferredTu) {
+        return ctx.graph.findIncluder(headerPath, { force: true, preferredTu });
+    }
+    if (recentIncluderUris.has(headerUri)) {
+        return ctx.graph.findRecentIncluder(headerPath, { force: true })
+            ?? ctx.graph.findIncluder(headerPath, { force: true });
+    }
+    return ctx.graph.findIncluder(headerPath, { force });
+}
+
+export function markTuReadyForPreamble(ctx: InstallContext, tuPath: string, reason: string): void {
+    if (!isTuPath(tuPath)) return;
+    tusObservedFromEditor.add(tuPath);
+    if (tusReady.has(tuPath)) return;
+    tusReady.add(tuPath);
+    ctx.log(`TU ${tuPath}: marked includer ready from ${reason}`);
+    const sr = ctx.scheduleReissue;
+    if (!sr) return;
+    setImmediate(() => {
+        tryResolvePending(ctx, sr);
+        refreshActiveHeadersForTu(ctx, sr, tuPath);
+    });
 }
 
 // ===== Outgoing param shifts =====
@@ -543,7 +598,7 @@ function handleOutgoingNotification(
                 return params;
             }
             const force = forcedUris.delete(td.uri);
-            const includer = ctx.graph.findIncluder(path, { force });
+            const includer = findHeaderIncluder(ctx, path, td.uri, force);
             if (includer) {
                 // Open companion virtually if not already live so clangd builds its PCH.
                 // If the source is already open in the editor, wait until clangd has
@@ -721,7 +776,7 @@ function tryResolvePending(
         const ready: PendingHeader[] = [];
         for (const [uri, h] of pendingHeaders) {
             const path = uriToFsPath(uri);
-            const includer = ctx.graph.findIncluder(path);
+            const includer = findHeaderIncluder(ctx, path, uri);
             if (includer && isTuReadyForPreamble(includer.tuPath)) {
                 ready.push(h);
             } else if (includer && h.waitForTuReady !== includer.tuPath) {
@@ -743,7 +798,7 @@ function tryResolvePending(
         if (disabledUris.has(uri)) continue;
         const fsPath = doc.uri.fsPath;
         if (!isHeaderPath(fsPath)) continue;
-        const includer = ctx.graph.findIncluder(fsPath);
+        const includer = findHeaderIncluder(ctx, fsPath, uri);
         if (!includer) continue;
         if (!isTuReadyForPreamble(includer.tuPath)) {
             rememberPendingHeader({
@@ -809,7 +864,7 @@ function refreshActiveHeadersForTu(
         if (!st || !st.active) continue;
         const fsPath = doc.uri.fsPath;
         if (!isHeaderPath(fsPath)) continue;
-        const includer = ctx.graph.findIncluder(fsPath);
+        const includer = findHeaderIncluder(ctx, fsPath, uri);
         if (!includer || includer.tuPath !== observedTu) continue;
         ctx.log(`active header ${fsPath}: includer ${observedTu} now in editor, replaying didOpen`);
         scheduleReissue({
