@@ -64,6 +64,7 @@ All commands live under the `clangd` category in the command palette.
 | `clangd-preamble.maxPreambleLines` | `1500` | Cap on lines emitted into the synthetic preamble. |
 | `clangd-preamble.maxPreambleBytes` | `65536` | Cap on bytes emitted into the synthetic preamble. |
 | `clangd-preamble.projectScanLimit` | `2000` | Maximum number of TU files visited by `Scan Project for Includer TUs`. |
+| `clangd-preamble.defaultSelector` | `preambleSize` | Default preamble source selector for headers without a per-file override. Use `preambleSize` for the smallest include prefix before the header, or `lastSeen` for the most recently observed includer TU. |
 | `clangd-preamble.markerComment` | `// __NSC_PREAMBLE_END__` | Single-line comment appended to the preamble so it ends on a known marker. |
 | `clangd-preamble.log` | `false` | Log middleware activity to the `clangd Preamble` output channel. |
 
@@ -82,9 +83,10 @@ to be observed, the status item shows `Preamble: pending` instead.
    graph indexed by basename.
 2. **Includer pick.** When a header opens, the graph is queried for the TU
    with the **shortest prefix-before-this-header** (tie-break: most recent
-   observation). Polluting includers (CEF wrappers, framework files that put
-   `common.h` after several other headers) are deprioritized. Companion-TU
-   fallback (`Foo.cpp` next to `Foo.h`) covers the header-opened-alone case.
+   observation) by default. `clangd-preamble.defaultSelector` can instead make
+   the default follow the most recently observed includer TU. Per-header
+   selector choices override this setting. Companion-TU fallback (`Foo.cpp`
+   next to `Foo.h`) covers the header-opened-alone case.
 3. **Self-contained skip.** Headers with **3 or more own `#include`
    directives** are likely self-contained and skipped automatically — the
    preamble can only introduce conflicts in that case. Manual commands

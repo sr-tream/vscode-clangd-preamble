@@ -27,6 +27,7 @@ export interface InstallContext {
     graph: Graph;
     store: StateStore;
     isEnabled: () => boolean;
+    defaultSelector?: () => 'preambleSize' | 'lastSeen';
     log: (msg: string) => void;
     marker: () => string;
     onStateChange?: (uri: string) => void;
@@ -184,6 +185,10 @@ function findHeaderIncluder(
     if (recentIncluderUris.has(headerUri)) {
         return ctx.graph.findRecentIncluder(headerPath, { force: true })
             ?? ctx.graph.findIncluder(headerPath, { force: true });
+    }
+    if (ctx.defaultSelector?.() === 'lastSeen') {
+        return ctx.graph.findRecentIncluder(headerPath, { force })
+            ?? ctx.graph.findIncluder(headerPath, { force });
     }
     return ctx.graph.findIncluder(headerPath, { force });
 }

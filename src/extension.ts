@@ -28,6 +28,7 @@ interface IncluderQuickPickItem extends vscode.QuickPickItem {
     auto?: boolean;
     recent?: boolean;
 }
+type DefaultSelector = 'preambleSize' | 'lastSeen';
 
 let logChannel: vscode.OutputChannel | undefined;
 function log(message: string): void {
@@ -37,6 +38,19 @@ function log(message: string): void {
 }
 function cfg<T>(key: string, fallback: T): T {
     return vscode.workspace.getConfiguration(CFG_NS).get<T>(key, fallback);
+}
+
+function defaultSelector(): DefaultSelector {
+    return cfg<string>('defaultSelector', 'preambleSize') === 'lastSeen' ? 'lastSeen' : 'preambleSize';
+}
+
+function defaultSelectorLabel(): string {
+    return defaultSelector() === 'lastSeen' ? 'last seen' : 'preamble size';
+}
+
+function usesRecentSelector(uri: string): boolean {
+    if (getPreferredIncluder(uri)) return false;
+    return isRecentIncluderMode(uri) || defaultSelector() === 'lastSeen';
 }
 
 const graph = new Graph();
@@ -55,6 +69,7 @@ const installCtx: InstallContext = {
     graph,
     store,
     isEnabled: () => cfg<boolean>('enabled', true),
+    defaultSelector,
     log,
     marker: () => cfg<string>('markerComment', '// __NSC_PREAMBLE_END__'),
     onStateChange: (uri: string) => stateChangeEmitter.fire(uri),
@@ -159,7 +174,7 @@ class PreambleStatus implements vscode.Disposable {
             const tuName = path.basename(st.includerTu);
             const selection = getPreferredIncluder(uri)
                 ? 'fixed'
-                : isRecentIncluderMode(uri) ? 'last seen' : 'auto';
+                : isRecentIncluderMode(uri) ? 'last seen' : `default (${defaultSelectorLabel()})`;
             this.item.command = 'clangd-preamble.selectIncluder';
             this.item.text = `$(file-symlink-file) Preamble: ${tuName}`;
             const md = new vscode.MarkdownString(
@@ -251,7 +266,7 @@ async function reissueRecentHeaderIfChanged(doc: vscode.TextDocument): Promise<b
     if (!attachedClient) return false;
     if (!isHeaderPath(doc.uri.fsPath)) return false;
     const uri = doc.uri.toString();
-    if (!isRecentIncluderMode(uri)) return false;
+    if (!usesRecentSelector(uri)) return false;
     const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
     if (!recent) return false;
     if (store.get(uri)?.includerTu === recent.tuPath) return false;
@@ -264,7 +279,7 @@ async function reissueRecentHeadersForTu(tuPath: string): Promise<void> {
     if (!attachedClient) return;
     for (const doc of vscode.workspace.textDocuments) {
         if (!isHeaderPath(doc.uri.fsPath)) continue;
-        if (!isRecentIncluderMode(doc.uri.toString())) continue;
+        if (!usesRecentSelector(doc.uri.toString())) continue;
         const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
         if (!recent || recent.tuPath !== tuPath) continue;
         await reissueRecentHeaderIfChanged(doc);
@@ -335,12 +350,13 @@ async function cmdSelectIncluder(): Promise<void> {
 
     const auto = graph.findIncluder(doc.uri.fsPath, { force: true });
     const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
+    const configuredDefault = defaultSelector() === 'lastSeen' ? (recent ?? auto) : auto;
     const items: IncluderQuickPickItem[] = [{
-        label: `${!preferred && !recentMode ? '$(check) ' : ''}Auto-select best includer`,
-        description: auto ? workspaceRelative(auto.tuPath) : undefined,
-        detail: auto
-            ? `${auto.prefixLines.length} preamble line(s), direct=${auto.direct}`
-            : 'Use the default shortest-prefix heuristic',
+        label: `${!preferred && !recentMode ? '$(check) ' : ''}Use configured default`,
+        description: defaultSelectorLabel(),
+        detail: configuredDefault
+            ? `Currently resolves to ${workspaceRelative(configuredDefault.tuPath)} (${configuredDefault.prefixLines.length} preamble line(s), direct=${configuredDefault.direct})`
+            : 'Use the configured default selector for this header',
         auto: true,
     }, {
         label: `${recentMode ? '$(check) ' : ''}Use last seen includer`,
@@ -385,6 +401,17 @@ async function cmdSelectIncluder(): Promise<void> {
         vscode.window.showInformationMessage(
             `clangd-preamble: using ${path.basename(st.includerTu)} (${st.preambleLines} lines)`,
         );
+    }
+}
+
+async function reissueDefaultSelectedHeaders(): Promise<void> {
+    if (!attachedClient) return;
+    for (const doc of vscode.workspace.textDocuments) {
+        if (!isHeaderPath(doc.uri.fsPath)) continue;
+        const uri = doc.uri.toString();
+        if (isDisabled(uri) || getPreferredIncluder(uri) || isRecentIncluderMode(uri)) continue;
+        markForced(uri);
+        await reissueDidOpen(attachedClient, doc);
     }
 }
 
@@ -526,6 +553,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         { dispose: () => stateSub?.dispose() },
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration(CFG_NS)) applyConfigToGraph();
+            if (e.affectsConfiguration(`${CFG_NS}.defaultSelector`)) void reissueDefaultSelectedHeaders();
         }),
         vscode.commands.registerCommand('clangd-preamble.reattach', () => cmdReattach(ext)),
         vscode.commands.registerCommand('clangd-preamble.refresh', cmdRefresh),
