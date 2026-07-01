@@ -7,5 +7,6 @@ node_modules/**
 out/**/*.map
 tsconfig.json
 package-lock.json
+*.vsix
 **/*.ts
 **/.eslintrc.json

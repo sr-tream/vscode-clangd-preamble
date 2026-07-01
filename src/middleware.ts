@@ -11,6 +11,7 @@ import {
 } from './positions';
 
 const SENTINEL = '__clangdPreambleInstalled__';
+const APPLY_EDIT_SENTINEL = '__clangdPreambleApplyEditInstalled__';
 const SUPPRESS = Symbol.for('clangdPreamble.suppress');
 
 // Companion TUs opened virtually (bypassing wrapper) so clangd builds their
@@ -38,6 +39,7 @@ interface MutableLanguageClient {
     clientOptions: { middleware?: any };
     sendNotification(method: any, params?: any): any;
     sendRequest(method: any, ...args: any[]): Thenable<any>;
+    handleApplyWorkspaceEdit?(params: any): Thenable<any>;
 }
 
 function methodOf(x: any): string | undefined {
@@ -179,6 +181,130 @@ function shiftHierarchyItems(items: any[], st: DocState): any[] {
         }
     }
     return items;
+}
+
+function summarizeWorkspaceEdit(we: any): string {
+    const parts: string[] = [];
+    const push = (uri: string | undefined, edits: any[] | undefined) => {
+        if (!uri || !Array.isArray(edits)) return;
+        const ranges = edits
+            .filter(e => e?.range)
+            .slice(0, 3)
+            .map(e => `${e.range.start.line}:${e.range.start.character}-${e.range.end.line}:${e.range.end.character}`)
+            .join(',');
+        parts.push(`${uri}#${edits.length}${ranges ? `(${ranges})` : ''}`);
+    };
+    if (we?.changes) {
+        for (const uri of Object.keys(we.changes)) push(uri, we.changes[uri]);
+    }
+    if (Array.isArray(we?.documentChanges)) {
+        for (const dc of we.documentChanges) {
+            push(dc?.textDocument?.uri, dc?.edits);
+        }
+    }
+    return parts.length > 0 ? parts.join(' | ') : '<no text edits>';
+}
+
+function shiftWorkspaceEditForActiveHeaders(we: any, store: StateStore, dir: 1 | -1): number {
+    let shifted = 0;
+    for (const st of store.values()) {
+        if (st.active) shifted += walkWorkspaceEdit(we, st.headerUri, st.preambleLines, dir);
+    }
+    return shifted;
+}
+
+function activeHeaderCount(store: StateStore): number {
+    let active = 0;
+    for (const st of store.values()) {
+        if (st.active) active++;
+    }
+    return active;
+}
+
+function summarizeCodeActionEdits(actions: any): string {
+    if (!Array.isArray(actions)) return '<not an array>';
+    const parts: string[] = [];
+    for (const action of actions) {
+        if (!action?.edit) continue;
+        parts.push(summarizeWorkspaceEdit(action.edit));
+        if (parts.length >= 5) break;
+    }
+    return parts.length > 0 ? parts.join(' || ') : '<no text edits>';
+}
+
+function shiftCodeActionEditsForActiveHeaders(actions: any, store: StateStore): number {
+    if (!Array.isArray(actions)) return 0;
+    let shifted = 0;
+    for (const action of actions) {
+        if (action?.edit) shifted += shiftWorkspaceEditForActiveHeaders(action.edit, store, -1);
+    }
+    return shifted;
+}
+
+function shiftCodeActionDiagnostics(actions: any, st: DocState): number {
+    if (!Array.isArray(actions)) return 0;
+    let shifted = 0;
+    for (const action of actions) {
+        if (!Array.isArray(action?.diagnostics)) continue;
+        for (const d of action.diagnostics) {
+            shiftRange(d.range, -st.preambleLines);
+            shifted++;
+        }
+    }
+    return shifted;
+}
+
+function remapCodeActionResult(result: any, ctx: InstallContext, requestUri: string | undefined, requestState?: DocState): any {
+    const active = activeHeaderCount(ctx.store);
+    if (active === 0) return result;
+    const before = summarizeCodeActionEdits(result);
+    const editShifted = shiftCodeActionEditsForActiveHeaders(result, ctx.store);
+    const diagShifted = requestState ? shiftCodeActionDiagnostics(result, requestState) : 0;
+    const after = summarizeCodeActionEdits(result);
+    ctx.log(`textDocument/codeAction: request=${requestUri ?? '<no-uri>'} activeHeaders=${active} shiftedEdits=${editShifted} shiftedDiagnostics=${diagShifted} before=${before} after=${after}`);
+    return result;
+}
+
+function remapWorkspaceEditResult(method: string, result: any, ctx: InstallContext, requestUri: string | undefined): any {
+    const active = activeHeaderCount(ctx.store);
+    if (active === 0) return result;
+    const before = summarizeWorkspaceEdit(result);
+    const shifted = shiftWorkspaceEditForActiveHeaders(result, ctx.store, -1);
+    const after = summarizeWorkspaceEdit(result);
+    ctx.log(`${method}: request=${requestUri ?? '<no-uri>'} activeHeaders=${active} shifted=${shifted} before=${before} after=${after}`);
+    return result;
+}
+
+function installApplyWorkspaceEditHook(client: MutableLanguageClient, ctx: InstallContext): boolean {
+    const c = client as any;
+    if (c[APPLY_EDIT_SENTINEL]) {
+        ctx.log('workspace/applyEdit hook already installed');
+        return false;
+    }
+    if (typeof client.handleApplyWorkspaceEdit !== 'function') {
+        ctx.log(`workspace/applyEdit hook unavailable (type=${typeof client.handleApplyWorkspaceEdit})`);
+        return false;
+    }
+
+    const origApplyWorkspaceEdit = client.handleApplyWorkspaceEdit.bind(client);
+    client.handleApplyWorkspaceEdit = function (this: any, params: any): Thenable<any> {
+        if (!ctx.isEnabled() || !params?.edit) return origApplyWorkspaceEdit(params);
+        try {
+            const copy = deepCopy(params);
+            const activeHeaders = Array.from(ctx.store.values()).filter(st => st.active).length;
+            const before = summarizeWorkspaceEdit(copy.edit);
+            const shifted = shiftWorkspaceEditForActiveHeaders(copy.edit, ctx.store, -1);
+            const after = summarizeWorkspaceEdit(copy.edit);
+            ctx.log(`workspace/applyEdit: active=${activeHeaders} shifted=${shifted} before=${before} after=${after}`);
+            return origApplyWorkspaceEdit(copy);
+        } catch (e) {
+            ctx.log(`workspace/applyEdit shift failed: ${(e as Error).message}`);
+            return origApplyWorkspaceEdit(params);
+        }
+    };
+    c[APPLY_EDIT_SENTINEL] = true;
+    ctx.log('workspace/applyEdit hook installed');
+    return true;
 }
 
 const IN: Record<string, InFn> = {
@@ -632,7 +758,8 @@ export function resolvePendingNow(ctx: InstallContext): number {
 export function installHooks(client: MutableLanguageClient, ctx: InstallContext): boolean {
     const opts: any = client.clientOptions ?? ((client as any).clientOptions = {});
     const middleware: any = opts.middleware ?? (opts.middleware = {});
-    if (middleware[SENTINEL]) return false;
+    const didInstallApplyEditHook = installApplyWorkspaceEditHook(client, ctx);
+    if (middleware[SENTINEL]) return didInstallApplyEditHook;
 
     // 1) Mutate the existing middleware object in place so it stays live for the
     //    already-running client. Don't overwrite — chain to whatever filter-files
@@ -752,9 +879,28 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
         const method = methodOf(args[0]);
         if (!method) return origRequest(...args);
         const params = args[1];
+        if (method === 'workspace/executeCommand') {
+            const arg = Array.isArray(params?.arguments) ? params.arguments[0] : undefined;
+            const uri = arg?.textDocument?.uri ?? arg?.file ?? '<no-uri>';
+            const pos = arg?.position ? `${arg.position.line}:${arg.position.character}` : '<no-pos>';
+            ctx.log(`workspace/executeCommand: command=${params?.command ?? '<unknown>'} uri=${uri} pos=${pos}`);
+        }
         const uri: string | undefined = params?.textDocument?.uri;
         const st = uri ? ctx.store.get(uri) : undefined;
-        if (!st || !st.active) return origRequest(...args);
+        if (!st || !st.active) {
+            const promise = origRequest(...args);
+            if (method !== 'textDocument/codeAction' && method !== 'textDocument/rename') return promise;
+            return Promise.resolve(promise).then((result: any) => {
+                if (result == null) return result;
+                try {
+                    if (method === 'textDocument/codeAction') return remapCodeActionResult(result, ctx, uri);
+                    if (method === 'textDocument/rename') return remapWorkspaceEditResult(method, result, ctx, uri);
+                } catch (e) {
+                    ctx.log(`${method} shift failed: ${(e as Error).message}`);
+                }
+                return result;
+            });
+        }
 
         const outFn = OUT[method];
         const newArgs = args.slice();
@@ -764,6 +910,18 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
         }
 
         const promise = origRequest(...newArgs);
+        if (method === 'textDocument/codeAction' || method === 'textDocument/rename') {
+            return Promise.resolve(promise).then((result: any) => {
+                if (result == null) return result;
+                try {
+                    if (method === 'textDocument/codeAction') return remapCodeActionResult(result, ctx, uri, st);
+                    if (method === 'textDocument/rename') return remapWorkspaceEditResult(method, result, ctx, uri);
+                } catch (e) {
+                    ctx.log(`${method} shift failed: ${(e as Error).message}`);
+                }
+                return result;
+            });
+        }
         const inFn = IN[method];
         if (!inFn) return promise;
         return Promise.resolve(promise).then((result: any) => {

@@ -119,8 +119,15 @@ export function processTextEdits(edits: any[], n: number): any[] {
     return out;
 }
 
-export function walkWorkspaceEdit(we: any, headerUri: string, n: number, dir: 1 | -1): void {
-    if (!we) return;
+function sameUri(a: string | undefined, b: string): boolean {
+    if (!a) return false;
+    if (a === b) return true;
+    try { return decodeURI(a) === decodeURI(b); } catch { return false; }
+}
+
+export function walkWorkspaceEdit(we: any, headerUri: string, n: number, dir: 1 | -1): number {
+    if (!we) return 0;
+    let shifted = 0;
     const process = (edits: any[] | undefined): any[] | undefined => {
         if (!Array.isArray(edits)) return edits;
         if (dir < 0) {
@@ -128,6 +135,7 @@ export function walkWorkspaceEdit(we: any, headerUri: string, n: number, dir: 1 
             for (const e of edits) {
                 if (e.range && !clipToUser(e.range, n)) {
                     shiftRange(e.range, dir * n);
+                    shifted++;
                     out.push(e);
                 } else if (!e.range) {
                     out.push(e);
@@ -135,22 +143,28 @@ export function walkWorkspaceEdit(we: any, headerUri: string, n: number, dir: 1 
             }
             return out;
         } else {
-            for (const e of edits) shiftRange(e.range, dir * n);
+            for (const e of edits) {
+                if (e.range) {
+                    shiftRange(e.range, dir * n);
+                    shifted++;
+                }
+            }
             return edits;
         }
     };
     if (we.changes) {
         for (const uri of Object.keys(we.changes)) {
-            if (uri === headerUri) we.changes[uri] = process(we.changes[uri]);
+            if (sameUri(uri, headerUri)) we.changes[uri] = process(we.changes[uri]);
         }
     }
     if (Array.isArray(we.documentChanges)) {
         for (const dc of we.documentChanges) {
-            if (dc.textDocument && dc.textDocument.uri === headerUri && dc.edits) {
+            if (dc.textDocument && sameUri(dc.textDocument.uri, headerUri) && dc.edits) {
                 dc.edits = process(dc.edits);
             }
         }
     }
+    return shifted;
 }
 
 // Process diagnostics array (raw LSP) — drop preamble-range entries, clip & shift the rest.
