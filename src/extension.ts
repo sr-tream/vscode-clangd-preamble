@@ -1,8 +1,11 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { Graph } from './graph';
+import { Graph, isHeaderPath } from './graph';
 import { StateStore } from './preamble';
-import { installHooks, InstallContext, resolvePendingNow, _pendingUris, markForced } from './middleware';
+import {
+    installHooks, InstallContext, resolvePendingNow, _pendingUris,
+    markForced, markDisabled, clearDisabled, isDisabled,
+} from './middleware';
 
 const CLANGD_EXTENSION_ID = 'llvm-vs-code-extensions.vscode-clangd';
 const CFG_NS = 'clangd-preamble';
@@ -128,8 +131,22 @@ class PreambleStatus implements vscode.Disposable {
         if (!editor || !installCtx.isEnabled()) { this.item.hide(); return; }
         const uri = editor.document.uri.toString();
         const st = store.get(uri);
+        if (isHeaderPath(editor.document.uri.fsPath) && isDisabled(uri)) {
+            this.item.command = 'clangd-preamble.enableBuf';
+            this.item.text = '$(circle-slash) Preamble: disabled';
+            const md = new vscode.MarkdownString(
+                `**clangd-preamble disabled**\n\n` +
+                `This header is currently sent to clangd without a synthetic preamble.\n\n` +
+                `[Enable for this file](command:clangd-preamble.enableBuf)`,
+            );
+            md.isTrusted = true;
+            this.item.tooltip = md;
+            this.item.show();
+            return;
+        }
         if (st && st.active) {
             const tuName = path.basename(st.includerTu);
+            this.item.command = 'clangd-preamble.refresh';
             this.item.text = `$(file-symlink-file) Preamble: ${tuName}`;
             const md = new vscode.MarkdownString(
                 `**clangd-preamble active**\n\n` +
@@ -145,6 +162,7 @@ class PreambleStatus implements vscode.Disposable {
             return;
         }
         if (_pendingUris().includes(uri)) {
+            this.item.command = 'clangd-preamble.refresh';
             this.item.text = `$(watch) Preamble: pending`;
             const md = new vscode.MarkdownString(
                 `**clangd-preamble waiting for includer**\n\n` +
@@ -191,9 +209,14 @@ function activeHeaderDoc(): vscode.TextDocument | undefined {
 async function cmdRefresh(): Promise<void> {
     const doc = activeHeaderDoc();
     if (!doc || !attachedClient) return;
+    if (!isHeaderPath(doc.uri.fsPath)) {
+        vscode.window.showWarningMessage('clangd-preamble: current file is not a header');
+        return;
+    }
     const uri = doc.uri.toString();
     const existing = store.get(uri);
     if (existing) graph.invalidate(existing.includerTu);
+    clearDisabled(uri);
     markForced(uri);
     await reissueDidOpen(attachedClient, doc);
     const st = store.get(uri);
@@ -209,21 +232,28 @@ async function cmdRefresh(): Promise<void> {
 async function cmdDisableBuf(): Promise<void> {
     const doc = activeHeaderDoc();
     if (!doc || !attachedClient) return;
-    const st = store.get(doc.uri.toString());
-    if (!st) {
-        vscode.window.showWarningMessage('clangd-preamble: no state for current file');
+    if (!isHeaderPath(doc.uri.fsPath)) {
+        vscode.window.showWarningMessage('clangd-preamble: current file is not a header');
         return;
     }
-    st.active = false;
-    store.delete(doc.uri.toString());
-    stateChangeEmitter.fire(doc.uri.toString());
+    const uri = doc.uri.toString();
+    markDisabled(uri);
+    store.delete(uri);
+    stateChangeEmitter.fire(uri);
     await reissueDidOpen(attachedClient, doc);
+    vscode.window.showInformationMessage('clangd-preamble: disabled for current file');
 }
 
 async function cmdEnableBuf(): Promise<void> {
     const doc = activeHeaderDoc();
     if (!doc || !attachedClient) return;
-    markForced(doc.uri.toString());
+    if (!isHeaderPath(doc.uri.fsPath)) {
+        vscode.window.showWarningMessage('clangd-preamble: current file is not a header');
+        return;
+    }
+    const uri = doc.uri.toString();
+    clearDisabled(uri);
+    markForced(uri);
     await reissueDidOpen(attachedClient, doc);
 }
 

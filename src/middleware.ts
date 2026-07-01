@@ -63,6 +63,17 @@ const forcedUris = new Set<string>();
 export function markForced(uri: string): void { forcedUris.add(uri); }
 export function clearForced(uri: string): void { forcedUris.delete(uri); }
 
+// Per-buffer opt-out. A disabled header must survive didClose+didOpen replays
+// used by commands, otherwise Disable immediately reopens and injects again.
+const disabledUris = new Set<string>();
+export function markDisabled(uri: string): void {
+    disabledUris.add(uri);
+    forcedUris.delete(uri);
+    pendingHeaders.delete(uri);
+}
+export function clearDisabled(uri: string): void { disabledUris.delete(uri); }
+export function isDisabled(uri: string): boolean { return disabledUris.has(uri); }
+
 // TU paths whose `didOpen` we have observed via the editor (wrapped notify or
 // the install-time syncOpenDocs sweep). Distinct from `graph.tuIncludes`,
 // which also contains disk-only entries created by the companion-TU fallback
@@ -524,6 +535,13 @@ function handleOutgoingNotification(
         if (!td) return params;
         const path = uriToFsPath(td.uri);
         if (isHeaderPath(path)) {
+            if (disabledUris.has(td.uri)) {
+                forcedUris.delete(td.uri);
+                pendingHeaders.delete(td.uri);
+                if (ctx.store.delete(td.uri)) ctx.onStateChange?.(td.uri);
+                ctx.log(`didOpen header ${path}: preamble disabled for buffer, passing through`);
+                return params;
+            }
             const force = forcedUris.delete(td.uri);
             const includer = ctx.graph.findIncluder(path, { force });
             if (includer) {
@@ -722,6 +740,7 @@ function tryResolvePending(
         const uri = doc.uri.toString();
         if (ctx.store.get(uri)) continue;
         if (pendingHeaders.has(uri)) continue;
+        if (disabledUris.has(uri)) continue;
         const fsPath = doc.uri.fsPath;
         if (!isHeaderPath(fsPath)) continue;
         const includer = ctx.graph.findIncluder(fsPath);
