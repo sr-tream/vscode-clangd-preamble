@@ -65,6 +65,7 @@ All commands live under the `clangd` category in the command palette.
 | `clangd-preamble.maxPreambleBytes` | `65536` | Cap on bytes emitted into the synthetic preamble. |
 | `clangd-preamble.projectScanLimit` | `2000` | Maximum number of TU files visited by `Scan Project for Includer TUs`. |
 | `clangd-preamble.graphCache` | `true` | Persist the observed/project-scanned TU include graph in VS Code workspace storage. Cached entries are validated by file size/mtime and invalidated by file change/delete/rename events. |
+| `clangd-preamble.indirectIncludeDepth` | `2` | Maximum include-chain depth for lazy indirect includer discovery when no direct includer TU is known. Set to `0` to disable. |
 | `clangd-preamble.defaultSelector` | `preambleSize` | Default preamble source selector for headers without a per-file override. Use `preambleSize` for the smallest include prefix before the header, or `lastSeen` for the most recently observed includer TU. |
 | `clangd-preamble.markerComment` | `// __NSC_PREAMBLE_END__` | Single-line comment appended to the preamble so it ends on a known marker. |
 | `clangd-preamble.log` | `false` | Log middleware activity to the `clangd Preamble` output channel. |
@@ -75,7 +76,8 @@ When the active editor is a header with an injected preamble, the status bar
 shows `Preamble: <TU>.cpp` with a tooltip listing the includer TU, preamble
 line count, direct/indirect flag, and dropped-diagnostic count. Clicking it
 runs `Refresh Current Header`. While a header is waiting for an includer TU
-to be observed, the status item shows `Preamble: pending` instead.
+to be observed, the status item shows `Preamble: pending` instead. Self-contained
+headers are passed through without a pending state, so the status item stays hidden.
 
 ## How it works
 
@@ -87,11 +89,18 @@ to be observed, the status item shows `Preamble: pending` instead.
    observation) by default. `clangd-preamble.defaultSelector` can instead make
    the default follow the most recently observed includer TU. Per-header
    selector choices override this setting. Companion-TU fallback (`Foo.cpp`
-   next to `Foo.h`) covers the header-opened-alone case.
+   next to `Foo.h`) covers the header-opened-alone case. If no direct includer
+   is known, the graph lazily walks observed TU include chains up to
+   `clangd-preamble.indirectIncludeDepth` and can build a preamble from the
+   includes before the chain that reaches the target header. Direct includers
+   always win, so indirect chains are not searched while a direct TU candidate
+   exists.
 3. **Self-contained skip.** Headers with **3 or more own `#include`
    directives** are likely self-contained and skipped automatically — the
    preamble can only introduce conflicts in that case. Manual commands
-   (`Refresh Current Header`, `Enable for Current File`) override.
+   (`Refresh Current Header`, `Enable for Current File`) override. If such a
+   skipped header later publishes clangd diagnostics, it is treated as
+   non-self-contained and replayed through the normal includer search.
 4. **Cycle filter.** Each prefix entry is checked (1 level deep) against the
    target header's basename — entries that transitively re-include the target
    are dropped to prevent redefinition cascades.

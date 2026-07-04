@@ -5,6 +5,7 @@ const INCLUDE_RE = /^\s*#\s*include\s*([\"<])([^\">]+)[\">]/;
 
 const CYCLE_CHECK_DEPTH = 1;
 const SELF_CONTAINED_INCLUDE_THRESHOLD = 3;
+const DEFAULT_INDIRECT_INCLUDE_DEPTH = 2;
 
 const SKIP_DIRS = new Set([
     'node_modules', '.git', 'build', 'out', '.cache', '.pixi', '.venv',
@@ -28,6 +29,7 @@ export interface IncluderCandidate extends IncluderPick {
     includeIndex: number;
     observedOrder: number;
     companion: boolean;
+    includeDepth?: number;
 }
 
 const HEADER_EXTS = new Set(['.h', '.hh', '.hpp', '.hxx', '.inl', '.inc', '.ipp', '.tcc', '.tpp']);
@@ -66,10 +68,22 @@ export interface GraphRestoreResult {
     unsupported: boolean;
 }
 
+interface PrefixState {
+    lines: string[];
+    bytes: number;
+}
+
+interface IndirectMatch {
+    prefixLines: string[];
+    includeIndex: number;
+    includeDepth: number;
+}
+
 export class Graph {
     private tuIncludes = new Map<string, IncludeEntry[]>();
     private headerUsers = new Map<string, Set<string>>();
     private tuMtime = new Map<string, number>();
+    private fileIncludeCache = new Map<string, IncludeEntry[]>();
     private pathCache = new Map<string, string | null>();
     private lruSeq = 0;
     private changeListeners = new Set<() => void>();
@@ -78,12 +92,14 @@ export class Graph {
         private maxPreambleLines = 1500,
         private maxPreambleBytes = 65536,
         private projectScanLimit = 2000,
+        private indirectIncludeDepth = DEFAULT_INDIRECT_INCLUDE_DEPTH,
     ) {}
 
-    setLimits(maxLines: number, maxBytes: number, scanLimit: number): void {
+    setLimits(maxLines: number, maxBytes: number, scanLimit: number, indirectIncludeDepth = this.indirectIncludeDepth): void {
         this.maxPreambleLines = maxLines;
         this.maxPreambleBytes = maxBytes;
         this.projectScanLimit = scanLimit;
+        this.indirectIncludeDepth = Math.max(0, Math.floor(indirectIncludeDepth));
     }
 
     onDidChange(listener: () => void): { dispose: () => void } {
@@ -123,6 +139,7 @@ export class Graph {
 
     private setTuIncludes(tuPath: string, incs: IncludeEntry[], observedOrder: number): void {
         this.unindexTu(tuPath);
+        this.fileIncludeCache.delete(tuPath);
         this.tuIncludes.set(tuPath, incs);
         this.tuMtime.set(tuPath, observedOrder);
         for (const e of incs) {
@@ -155,7 +172,8 @@ export class Graph {
         this.unindexTu(tuPath);
         this.tuIncludes.delete(tuPath);
         this.tuMtime.delete(tuPath);
-        if (isHeaderPath(tuPath)) this.pathCache.delete(path.basename(tuPath));
+        this.fileIncludeCache.delete(tuPath);
+        if (isHeaderPath(tuPath)) this.clearPathCacheFor(tuPath);
         if (hadPersistedEntry) this.emitChange();
     }
 
@@ -266,6 +284,10 @@ export class Graph {
         return tuInc.length;
     }
 
+    private samePath(a: string, b: string): boolean {
+        return path.normalize(a) === path.normalize(b);
+    }
+
     private candidateFromTu(
         tuPath: string,
         headerPath: string,
@@ -309,11 +331,23 @@ export class Graph {
         return this.sortCandidates(out);
     }
 
+    private pathCacheKey(basename: string, root: string): string {
+        return `${root}\0${basename}`;
+    }
+
+    private clearPathCacheFor(filepath: string): void {
+        const basename = path.basename(filepath);
+        for (const key of Array.from(this.pathCache.keys())) {
+            if (key.endsWith(`\0${basename}`)) this.pathCache.delete(key);
+        }
+    }
+
     // Walk root recursively for a file matching `basename`. Cached per-basename
     // (positive or null), since the cycle-check below may query the same name
     // many times across one buildPrefix.
     private findHeaderPath(basename: string, root: string): string | undefined {
-        const cached = this.pathCache.get(basename);
+        const cacheKey = this.pathCacheKey(basename, root);
+        const cached = this.pathCache.get(cacheKey);
         if (cached !== undefined) return cached ?? undefined;
         const stack: string[] = [root];
         while (stack.length > 0) {
@@ -324,7 +358,7 @@ export class Graph {
             for (const e of ents) {
                 if (e.isFile() && e.name === basename) {
                     const p = path.join(dir, e.name);
-                    this.pathCache.set(basename, p);
+                    this.pathCache.set(cacheKey, p);
                     return p;
                 }
                 if (e.isDirectory() && !SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) {
@@ -332,19 +366,38 @@ export class Graph {
                 }
             }
         }
-        this.pathCache.set(basename, null);
+        this.pathCache.set(cacheKey, null);
         return undefined;
     }
 
     private fileIncludes(filepath: string): IncludeEntry[] | undefined {
-        const cached = this.tuIncludes.get(filepath);
+        const cached = this.tuIncludes.get(filepath) ?? this.fileIncludeCache.get(filepath);
         if (cached) return cached;
         let text: string;
         try { text = fs.readFileSync(filepath, 'utf8'); }
         catch { return undefined; }
         const incs = this.parseText(text);
-        this.tuIncludes.set(filepath, incs);
+        this.fileIncludeCache.set(filepath, incs);
         return incs;
+    }
+
+    private resolveIncludePath(fromPath: string, entry: IncludeEntry, root: string): string | undefined {
+        if (entry.kind === '"') {
+            const local = path.resolve(path.dirname(fromPath), entry.name);
+            try {
+                if (fs.statSync(local).isFile()) return local;
+            } catch {/* ignore */}
+        }
+        if (!isHeaderPath(entry.name)) return undefined;
+        return this.findHeaderPath(path.basename(entry.name), root);
+    }
+
+    private includeEntryMatchesHeader(
+        fromPath: string, entry: IncludeEntry, headerPath: string, root: string,
+    ): boolean {
+        const resolved = this.resolveIncludePath(fromPath, entry, root);
+        if (resolved) return this.samePath(resolved, headerPath);
+        return path.basename(entry.name) === path.basename(headerPath);
     }
 
     // True if a header named `startBn` (recursively, up to `depth`) #include's
@@ -375,21 +428,120 @@ export class Graph {
         for (let i = 0; i < tuInc.length; i++) {
             if (path.basename(tuInc[i].name) === headerBasename) { cut = i; break; }
         }
-        const lines: string[] = [];
-        let bytes = 0;
         const stop = cut >= 0 ? cut : tuInc.length;
+        const state: PrefixState = { lines: [], bytes: 0 };
+        this.appendFilteredPrefix(tuInc, stop, headerBasename, root, state);
+        return { lines: state.lines, direct: cut >= 0 };
+    }
+
+    private appendFilteredPrefix(
+        includes: IncludeEntry[], stop: number, headerBasename: string, root: string, state: PrefixState,
+    ): void {
         for (let i = 0; i < stop; i++) {
-            const e = tuInc[i];
+            const e = includes[i];
             const prefixBn = path.basename(e.name);
-            if (prefixBn !== headerBasename
-                && !this.transitivelyIncludes(prefixBn, headerBasename, root, CYCLE_CHECK_DEPTH, new Set())) {
-                const raw = e.raw;
-                bytes += raw.length + 1;
-                if (lines.length >= this.maxPreambleLines || bytes > this.maxPreambleBytes) break;
-                lines.push(raw);
+            if (prefixBn === headerBasename
+                || this.transitivelyIncludes(prefixBn, headerBasename, root, CYCLE_CHECK_DEPTH, new Set())) {
+                continue;
             }
+            const raw = e.raw;
+            const nextBytes = state.bytes + raw.length + 1;
+            if (state.lines.length >= this.maxPreambleLines || nextBytes > this.maxPreambleBytes) break;
+            state.bytes = nextBytes;
+            state.lines.push(raw);
         }
-        return { lines, direct: cut >= 0 };
+    }
+
+    private clonePrefixState(state: PrefixState): PrefixState {
+        return { lines: [...state.lines], bytes: state.bytes };
+    }
+
+    private findIndirectMatchInFile(
+        currentPath: string,
+        includes: IncludeEntry[],
+        headerPath: string,
+        root: string,
+        depthRemaining: number,
+        prefix: PrefixState,
+        seen: Set<string>,
+        rootIndex: number | undefined,
+        currentDepth: number,
+    ): IndirectMatch | undefined {
+        const headerBasename = path.basename(headerPath);
+        for (let i = 0; i < includes.length; i++) {
+            const entry = includes[i];
+            const nextPrefix = this.clonePrefixState(prefix);
+            this.appendFilteredPrefix(includes, i, headerBasename, root, nextPrefix);
+            const includeIndex = rootIndex ?? i;
+            const matchesTarget = this.includeEntryMatchesHeader(currentPath, entry, headerPath, root);
+            if (matchesTarget) {
+                if (rootIndex !== undefined) {
+                    return {
+                        prefixLines: nextPrefix.lines,
+                        includeIndex,
+                        includeDepth: currentDepth + 1,
+                    };
+                }
+                continue;
+            }
+            if (depthRemaining <= 1) continue;
+            const resolved = this.resolveIncludePath(currentPath, entry, root);
+            if (!resolved || !isHeaderPath(resolved) || seen.has(resolved)) continue;
+            const childIncludes = this.fileIncludes(resolved);
+            if (!childIncludes) continue;
+            seen.add(resolved);
+            const found = this.findIndirectMatchInFile(
+                resolved,
+                childIncludes,
+                headerPath,
+                root,
+                depthRemaining - 1,
+                nextPrefix,
+                seen,
+                includeIndex,
+                currentDepth + 1,
+            );
+            seen.delete(resolved);
+            if (found) return found;
+        }
+        return undefined;
+    }
+
+    private indirectCandidateFromTu(tuPath: string, headerPath: string): IncluderCandidate | undefined {
+        if (this.indirectIncludeDepth < 2) return undefined;
+        const tuInc = this.tuIncludes.get(tuPath);
+        if (!tuInc || !isTuPath(tuPath)) return undefined;
+        const root = this.projectRootForTu(tuPath);
+        const found = this.findIndirectMatchInFile(
+            tuPath,
+            tuInc,
+            headerPath,
+            root,
+            this.indirectIncludeDepth,
+            { lines: [], bytes: 0 },
+            new Set([tuPath]),
+            undefined,
+            0,
+        );
+        if (!found || found.prefixLines.length === 0) return undefined;
+        return {
+            tuPath,
+            prefixLines: found.prefixLines,
+            direct: false,
+            includeIndex: found.includeIndex,
+            observedOrder: this.tuMtime.get(tuPath) ?? 0,
+            companion: false,
+            includeDepth: found.includeDepth,
+        };
+    }
+
+    private indirectCandidates(headerPath: string): IncluderCandidate[] {
+        const out: IncluderCandidate[] = [];
+        for (const tu of this.tuIncludes.keys()) {
+            const candidate = this.indirectCandidateFromTu(tu, headerPath);
+            if (candidate) out.push(candidate);
+        }
+        return this.sortCandidates(out);
     }
 
     // A header with many own #includes is likely making a deliberate effort to
@@ -408,6 +560,10 @@ export class Graph {
             }
         }
         return false;
+    }
+
+    isSelfContainedHeader(filepath: string): boolean {
+        return this.headerIsSelfContained(filepath);
     }
 
     // Walk up from `tu`'s directory looking for .git or compile_commands.json,
@@ -435,7 +591,9 @@ export class Graph {
         }
         const observed = this.observedCandidates(headerPath);
         if (observed.length > 0) return observed[0];
-        return this.companionCandidate(headerPath);
+        const comp = this.companionCandidate(headerPath);
+        if (comp) return comp;
+        return this.indirectCandidates(headerPath)[0];
     }
 
     findRecentIncluder(headerPath: string, options: FindIncluderOptions = {}): IncluderPick | undefined {
@@ -453,6 +611,11 @@ export class Graph {
         const out = this.observedCandidates(headerPath);
         const comp = this.companionCandidate(headerPath);
         if (comp && !out.some(c => c.tuPath === comp.tuPath)) out.push(comp);
+        if (out.length === 0 || out.every(c => c.companion)) {
+            for (const c of this.indirectCandidates(headerPath)) {
+                if (!out.some(existing => existing.tuPath === c.tuPath)) out.push(c);
+            }
+        }
         return this.sortCandidates(out);
     }
 

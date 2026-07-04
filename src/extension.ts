@@ -73,6 +73,7 @@ function applyConfigToGraph(): void {
         cfg<number>('maxPreambleLines', 1500),
         cfg<number>('maxPreambleBytes', 65536),
         cfg<number>('projectScanLimit', 2000),
+        cfg<number>('indirectIncludeDepth', 2),
     );
 }
 
@@ -362,6 +363,7 @@ function observeLastActiveTu(): string | undefined {
 async function reissueRecentHeaderIfChanged(doc: vscode.TextDocument): Promise<boolean> {
     if (!attachedClient) return false;
     if (!isHeaderPath(doc.uri.fsPath)) return false;
+    if (graph.isSelfContainedHeader(doc.uri.fsPath)) return false;
     const uri = doc.uri.toString();
     if (!usesRecentSelector(uri)) return false;
     const recent = graph.findRecentIncluder(doc.uri.fsPath, { force: true });
@@ -505,6 +507,7 @@ async function reissueDefaultSelectedHeaders(): Promise<void> {
     if (!attachedClient) return;
     for (const doc of vscode.workspace.textDocuments) {
         if (!isHeaderPath(doc.uri.fsPath)) continue;
+        if (graph.isSelfContainedHeader(doc.uri.fsPath)) continue;
         const uri = doc.uri.toString();
         if (isDisabled(uri) || getPreferredIncluder(uri) || isRecentIncluderMode(uri)) continue;
         markForced(uri);

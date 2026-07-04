@@ -15,7 +15,7 @@
     "homepage": "https://github.com/sr-tream/vscode-clangd-preamble#readme",
     "displayName": "clangd Non-Self-Contained Header Hook",
     "description": "Make non-self-contained C/C++ headers parse cleanly under clangd by injecting a fake preamble from a recently-seen includer TU and remapping positions across LSP traffic.",
-    "version": "0.3.2",
+    "version": "0.3.3",
     "engines": {
         "vscode": "^1.75.0"
     },
@@ -64,6 +64,12 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Persist the observed/project-scanned TU include graph in workspace storage and invalidate stale entries by file metadata and file events."
+                },
+                "clangd-preamble.indirectIncludeDepth": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 0,
+                    "description": "Maximum include-chain depth for lazy indirect includer discovery when no direct includer TU is known. Set to 0 to disable indirect scanning."
                 },
                 "clangd-preamble.defaultSelector": {
                     "type": "string",

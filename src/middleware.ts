@@ -64,6 +64,12 @@ const forcedUris = new Set<string>();
 export function markForced(uri: string): void { forcedUris.add(uri); }
 export function clearForced(uri: string): void { forcedUris.delete(uri); }
 
+// Headers that looked self-contained by the cheap include-count heuristic, but
+// later produced clangd diagnostics when opened without a preamble. These become
+// eligible for a forced includer search while clean self-contained headers stay
+// pass-through and hidden from the status bar.
+const diagnosticSelfContainedUris = new Set<string>();
+
 // Sticky per-buffer includer override chosen from the status-bar selector.
 // It survives reissue cycles until the user switches back to auto or disables
 // the header.
@@ -92,6 +98,7 @@ const disabledUris = new Set<string>();
 export function markDisabled(uri: string): void {
     disabledUris.add(uri);
     forcedUris.delete(uri);
+    diagnosticSelfContainedUris.delete(uri);
     preferredIncluders.delete(uri);
     recentIncluderUris.delete(uri);
     pendingHeaders.delete(uri);
@@ -603,7 +610,15 @@ function handleOutgoingNotification(
                 return params;
             }
             const force = forcedUris.delete(td.uri);
-            const includer = findHeaderIncluder(ctx, path, td.uri, force);
+            const diagnosticRetry = diagnosticSelfContainedUris.has(td.uri);
+            if (!force && !diagnosticRetry && ctx.graph.isSelfContainedHeader(path)) {
+                const hadPending = pendingHeaders.delete(td.uri);
+                const hadState = ctx.store.delete(td.uri);
+                if (hadPending || hadState) ctx.onStateChange?.(td.uri);
+                ctx.log(`didOpen header ${path}: self-contained, passing through`);
+                return params;
+            }
+            const includer = findHeaderIncluder(ctx, path, td.uri, force || diagnosticRetry);
             if (includer) {
                 // Open companion virtually if not already live so clangd builds its PCH.
                 // If the source is already open in the editor, wait until clangd has
@@ -777,11 +792,19 @@ function tryResolvePending(
     ctx: InstallContext,
     scheduleReissue: (h: PendingHeader) => void,
 ): void {
+    const scheduledUris = new Set<string>();
     if (pendingHeaders.size > 0) {
         const ready: PendingHeader[] = [];
         for (const [uri, h] of pendingHeaders) {
             const path = uriToFsPath(uri);
-            const includer = findHeaderIncluder(ctx, path, uri);
+            const diagnosticRetry = diagnosticSelfContainedUris.has(uri);
+            if (!diagnosticRetry && ctx.graph.isSelfContainedHeader(path)) {
+                pendingHeaders.delete(uri);
+                ctx.onStateChange?.(uri);
+                ctx.log(`pending header ${path}: self-contained, removing from pending`);
+                continue;
+            }
+            const includer = findHeaderIncluder(ctx, path, uri, diagnosticRetry);
             if (includer && isTuReadyForPreamble(includer.tuPath)) {
                 ready.push(h);
             } else if (includer && h.waitForTuReady !== includer.tuPath) {
@@ -793,17 +816,21 @@ function tryResolvePending(
             pendingHeaders.delete(h.uri);
             ctx.onStateChange?.(h.uri);
             ctx.log(`pending header ${uriToFsPath(h.uri)}: includer now available, replaying didOpen`);
+            scheduledUris.add(h.uri);
             scheduleReissue(h);
         }
     }
     for (const doc of vscode.workspace.textDocuments) {
         const uri = doc.uri.toString();
         if (ctx.store.get(uri)) continue;
+        if (scheduledUris.has(uri)) continue;
         if (pendingHeaders.has(uri)) continue;
         if (disabledUris.has(uri)) continue;
         const fsPath = doc.uri.fsPath;
         if (!isHeaderPath(fsPath)) continue;
-        const includer = findHeaderIncluder(ctx, fsPath, uri);
+        const diagnosticRetry = diagnosticSelfContainedUris.has(uri);
+        if (!diagnosticRetry && ctx.graph.isSelfContainedHeader(fsPath)) continue;
+        const includer = findHeaderIncluder(ctx, fsPath, uri, diagnosticRetry);
         if (!includer) continue;
         if (!isTuReadyForPreamble(includer.tuPath)) {
             rememberPendingHeader({
@@ -985,11 +1012,39 @@ export function installHooks(client: MutableLanguageClient, ctx: InstallContext)
         const uriStr = uri.toString();
         const st = ctx.store.get(uriStr);
         if (!st || !st.active) {
-            // If a pending header is now publishing diagnostics (typically the
-            // unresolved-symbol cascade), check if the graph has since gained an
-            // includer and replay didOpen if so.
-            if (pendingHeaders.has(uriStr) && diagnostics.length > 0) {
-                resolvePendingNow(ctx);
+            if (diagnostics.length > 0) {
+                if (isHeaderPath(diagFsPath) && !disabledUris.has(uriStr) && ctx.graph.isSelfContainedHeader(diagFsPath)) {
+                    const wasDiagnosticRetry = diagnosticSelfContainedUris.has(uriStr);
+                    diagnosticSelfContainedUris.add(uriStr);
+                    if (!pendingHeaders.has(uriStr)) {
+                        const doc = vscode.workspace.textDocuments.find(d => d.uri.toString() === uriStr);
+                        const sr = ctx.scheduleReissue;
+                        const includer = sr && doc ? findHeaderIncluder(ctx, diagFsPath, uriStr, true) : undefined;
+                        if (doc && sr && includer && isTuReadyForPreamble(includer.tuPath)) {
+                            ctx.log(`self-contained header ${diagFsPath}: diagnostics received, replaying with includer ${includer.tuPath}`);
+                            sr({
+                                uri: uriStr,
+                                languageId: doc.languageId,
+                                version: doc.version,
+                                text: doc.getText(),
+                            });
+                        } else if (doc && includer) {
+                            rememberPendingHeader({
+                                uri: uriStr,
+                                languageId: doc.languageId,
+                                version: doc.version,
+                                text: doc.getText(),
+                                waitForTuReady: includer.tuPath,
+                            }, ctx, `self-contained header ${diagFsPath}: diagnostics received, includer ${includer.tuPath} not ready`);
+                        } else if (!wasDiagnosticRetry) {
+                            ctx.log(`self-contained header ${diagFsPath}: diagnostics received, no includer available yet`);
+                        }
+                    }
+                }
+                // If a pending header is now publishing diagnostics (typically
+                // the unresolved-symbol cascade), check if the graph has since
+                // gained an includer and replay didOpen if so.
+                if (pendingHeaders.has(uriStr)) resolvePendingNow(ctx);
             }
             return (prevDiag ?? next)(uri, diagnostics, next);
         }
