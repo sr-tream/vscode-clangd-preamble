@@ -45,12 +45,34 @@ export interface FindIncluderOptions {
     preferredTu?: string;
 }
 
+export interface CachedTuEntry {
+    path: string;
+    includes: IncludeEntry[];
+    mtimeMs: number;
+    size: number;
+    observedOrder: number;
+}
+
+export interface GraphSnapshot {
+    version: 1;
+    createdAt: number;
+    lruSeq: number;
+    tus: CachedTuEntry[];
+}
+
+export interface GraphRestoreResult {
+    loaded: number;
+    dropped: number;
+    unsupported: boolean;
+}
+
 export class Graph {
     private tuIncludes = new Map<string, IncludeEntry[]>();
     private headerUsers = new Map<string, Set<string>>();
     private tuMtime = new Map<string, number>();
     private pathCache = new Map<string, string | null>();
     private lruSeq = 0;
+    private changeListeners = new Set<() => void>();
 
     constructor(
         private maxPreambleLines = 1500,
@@ -64,6 +86,15 @@ export class Graph {
         this.projectScanLimit = scanLimit;
     }
 
+    onDidChange(listener: () => void): { dispose: () => void } {
+        this.changeListeners.add(listener);
+        return { dispose: () => this.changeListeners.delete(listener) };
+    }
+
+    private emitChange(): void {
+        for (const listener of this.changeListeners) listener();
+    }
+
     private parseText(text: string): IncludeEntry[] {
         const out: IncludeEntry[] = [];
         const lines = text.split(/\r?\n/);
@@ -74,16 +105,39 @@ export class Graph {
         return out;
     }
 
-    observeTu(tuPath: string, sourceText: string): void {
-        const incs = this.parseText(sourceText);
+    private cloneIncludes(incs: IncludeEntry[]): IncludeEntry[] {
+        return incs.map((e) => ({ name: e.name, kind: e.kind, line: e.line, raw: e.raw }));
+    }
+
+    private unindexTu(tuPath: string): void {
+        const old = this.tuIncludes.get(tuPath);
+        if (!old) return;
+        for (const e of old) {
+            const bn = path.basename(e.name);
+            const users = this.headerUsers.get(bn);
+            if (!users) continue;
+            users.delete(tuPath);
+            if (users.size === 0) this.headerUsers.delete(bn);
+        }
+    }
+
+    private setTuIncludes(tuPath: string, incs: IncludeEntry[], observedOrder: number): void {
+        this.unindexTu(tuPath);
         this.tuIncludes.set(tuPath, incs);
-        this.tuMtime.set(tuPath, ++this.lruSeq);
+        this.tuMtime.set(tuPath, observedOrder);
         for (const e of incs) {
             const bn = path.basename(e.name);
             let users = this.headerUsers.get(bn);
             if (!users) { users = new Set(); this.headerUsers.set(bn, users); }
             users.add(tuPath);
         }
+        if (observedOrder > this.lruSeq) this.lruSeq = observedOrder;
+    }
+
+    observeTu(tuPath: string, sourceText: string): void {
+        const incs = this.parseText(sourceText);
+        this.setTuIncludes(tuPath, incs, ++this.lruSeq);
+        this.emitChange();
     }
 
     observeTuFromDisk(tuPath: string): boolean {
@@ -97,7 +151,91 @@ export class Graph {
     }
 
     invalidate(tuPath: string): void {
+        const hadPersistedEntry = isTuPath(tuPath) && this.tuIncludes.has(tuPath);
+        this.unindexTu(tuPath);
         this.tuIncludes.delete(tuPath);
+        this.tuMtime.delete(tuPath);
+        if (isHeaderPath(tuPath)) this.pathCache.delete(path.basename(tuPath));
+        if (hadPersistedEntry) this.emitChange();
+    }
+
+    snapshot(): GraphSnapshot {
+        const tus = Array.from(this.tuIncludes.entries())
+            .filter(([tuPath]) => isTuPath(tuPath))
+            .map(([tuPath, includes]) => ({
+                tuPath,
+                includes,
+                observedOrder: this.tuMtime.get(tuPath) ?? 0,
+            }))
+            .sort((a, b) => b.observedOrder - a.observedOrder)
+            .slice(0, this.projectScanLimit);
+        const entries: CachedTuEntry[] = [];
+        for (const tu of tus) {
+            try {
+                const st = fs.statSync(tu.tuPath);
+                if (!st.isFile()) continue;
+                entries.push({
+                    path: tu.tuPath,
+                    includes: this.cloneIncludes(tu.includes),
+                    mtimeMs: st.mtimeMs,
+                    size: st.size,
+                    observedOrder: tu.observedOrder,
+                });
+            } catch {/* ignore stale files */}
+        }
+        return { version: 1, createdAt: Date.now(), lruSeq: this.lruSeq, tus: entries };
+    }
+
+    restoreSnapshot(snapshot: unknown): GraphRestoreResult {
+        if (!this.isGraphSnapshot(snapshot)) {
+            return { loaded: 0, dropped: 0, unsupported: snapshot !== undefined };
+        }
+        let loaded = 0;
+        let dropped = 0;
+        for (const entry of snapshot.tus) {
+            try {
+                const st = fs.statSync(entry.path);
+                if (!st.isFile() || st.mtimeMs !== entry.mtimeMs || st.size !== entry.size) {
+                    dropped++;
+                    continue;
+                }
+            } catch {
+                dropped++;
+                continue;
+            }
+            this.setTuIncludes(entry.path, this.cloneIncludes(entry.includes), entry.observedOrder);
+            loaded++;
+        }
+        if (snapshot.lruSeq > this.lruSeq) this.lruSeq = snapshot.lruSeq;
+        return { loaded, dropped, unsupported: false };
+    }
+
+    private isGraphSnapshot(value: unknown): value is GraphSnapshot {
+        if (!value || typeof value !== 'object') return false;
+        const snap = value as Partial<GraphSnapshot>;
+        if (snap.version !== 1 || !Array.isArray(snap.tus)) return false;
+        if (typeof snap.createdAt !== 'number' || typeof snap.lruSeq !== 'number') return false;
+        return snap.tus.every((entry) => this.isCachedTuEntry(entry));
+    }
+
+    private isCachedTuEntry(value: unknown): value is CachedTuEntry {
+        if (!value || typeof value !== 'object') return false;
+        const entry = value as Partial<CachedTuEntry>;
+        return typeof entry.path === 'string'
+            && typeof entry.mtimeMs === 'number'
+            && typeof entry.size === 'number'
+            && typeof entry.observedOrder === 'number'
+            && Array.isArray(entry.includes)
+            && entry.includes.every((inc) => this.isIncludeEntry(inc));
+    }
+
+    private isIncludeEntry(value: unknown): value is IncludeEntry {
+        if (!value || typeof value !== 'object') return false;
+        const entry = value as Partial<IncludeEntry>;
+        return typeof entry.name === 'string'
+            && (entry.kind === '"' || entry.kind === '<')
+            && typeof entry.line === 'number'
+            && typeof entry.raw === 'string';
     }
 
     private companionTu(headerPath: string): string | undefined {

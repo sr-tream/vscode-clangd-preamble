@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { Graph, isHeaderPath, isTuPath } from './graph';
+import type { GraphSnapshot } from './graph';
 import { StateStore } from './preamble';
 import {
     installHooks, InstallContext, resolvePendingNow, _pendingUris,
@@ -11,6 +12,10 @@ import {
 
 const CLANGD_EXTENSION_ID = 'llvm-vs-code-extensions.vscode-clangd';
 const CFG_NS = 'clangd-preamble';
+const GRAPH_CACHE_KEY = 'graphCache.v1';
+const GRAPH_CACHE_SAVE_DELAY_MS = 1000;
+const TU_WATCH_GLOB = '**/*.{cpp,cc,cxx,c,C,mm}';
+const HEADER_WATCH_GLOB = '**/*.{h,hh,hpp,hxx,inl,inc,ipp,tcc,tpp}';
 
 const enum LCState { Stopped = 1, Running = 2, Starting = 3 }
 interface StateChangeEvent { oldState: LCState; newState: LCState; }
@@ -53,15 +58,107 @@ function usesRecentSelector(uri: string): boolean {
     return isRecentIncluderMode(uri) || defaultSelector() === 'lastSeen';
 }
 
+function graphCacheEnabled(): boolean {
+    return cfg<boolean>('graphCache', true);
+}
+
 const graph = new Graph();
 const store = new StateStore();
 const stateChangeEmitter = new vscode.EventEmitter<string>();
+let graphCacheContext: vscode.ExtensionContext | undefined;
+let graphCacheSaveTimer: NodeJS.Timeout | undefined;
 
 function applyConfigToGraph(): void {
     graph.setLimits(
         cfg<number>('maxPreambleLines', 1500),
         cfg<number>('maxPreambleBytes', 65536),
         cfg<number>('projectScanLimit', 2000),
+    );
+}
+
+function restoreGraphCache(context: vscode.ExtensionContext): void {
+    if (!graphCacheEnabled()) return;
+    const cached = context.workspaceState.get<unknown>(GRAPH_CACHE_KEY);
+    if (cached === undefined) return;
+    const result = graph.restoreSnapshot(cached);
+    if (result.unsupported) {
+        void context.workspaceState.update(GRAPH_CACHE_KEY, undefined);
+        log('graph cache ignored: unsupported snapshot');
+        return;
+    }
+    if (result.loaded > 0 || result.dropped > 0) {
+        log(`graph cache restored: loaded=${result.loaded}, dropped=${result.dropped}`);
+    }
+    if (result.dropped > 0) scheduleGraphCacheSave(5000);
+}
+
+function scheduleGraphCacheSave(delayMs = GRAPH_CACHE_SAVE_DELAY_MS): void {
+    if (!graphCacheContext || !graphCacheEnabled()) return;
+    if (graphCacheSaveTimer) clearTimeout(graphCacheSaveTimer);
+    graphCacheSaveTimer = setTimeout(() => {
+        graphCacheSaveTimer = undefined;
+        void saveGraphCacheNow();
+    }, delayMs);
+}
+
+async function saveGraphCacheNow(): Promise<void> {
+    if (!graphCacheContext || !graphCacheEnabled()) return;
+    const snapshot: GraphSnapshot = graph.snapshot();
+    try {
+        await graphCacheContext.workspaceState.update(GRAPH_CACHE_KEY, snapshot);
+        log(`graph cache saved: ${snapshot.tus.length} TU(s)`);
+    } catch (e) {
+        log(`graph cache save failed: ${(e as Error).message}`);
+    }
+}
+
+function observeTuFromCurrentSource(uri: vscode.Uri): void {
+    const fsPath = uri.fsPath;
+    if (!isTuPath(fsPath)) return;
+    const openDoc = vscode.workspace.textDocuments.find((doc) => doc.uri.fsPath === fsPath);
+    if (openDoc) {
+        graph.observeTu(fsPath, openDoc.getText());
+    } else {
+        graph.invalidate(fsPath);
+        graph.observeTuFromDisk(fsPath);
+    }
+    const resolved = resolvePendingNow(installCtx);
+    if (resolved > 0) log(`graph cache file update resolved ${resolved} pending header(s)`);
+}
+
+function invalidateCachedPath(uri: vscode.Uri): void {
+    const fsPath = uri.fsPath;
+    if (isTuPath(fsPath) || isHeaderPath(fsPath)) graph.invalidate(fsPath);
+}
+
+function registerGraphInvalidation(context: vscode.ExtensionContext): void {
+    const tuWatcher = vscode.workspace.createFileSystemWatcher(TU_WATCH_GLOB);
+    const headerWatcher = vscode.workspace.createFileSystemWatcher(HEADER_WATCH_GLOB);
+    context.subscriptions.push(
+        tuWatcher,
+        headerWatcher,
+        tuWatcher.onDidCreate(observeTuFromCurrentSource),
+        tuWatcher.onDidChange(observeTuFromCurrentSource),
+        tuWatcher.onDidDelete(invalidateCachedPath),
+        headerWatcher.onDidChange(invalidateCachedPath),
+        headerWatcher.onDidDelete(invalidateCachedPath),
+        vscode.workspace.onDidSaveTextDocument((doc) => {
+            if (isTuPath(doc.uri.fsPath)) {
+                graph.observeTu(doc.uri.fsPath, doc.getText());
+            } else if (isHeaderPath(doc.uri.fsPath)) {
+                graph.invalidate(doc.uri.fsPath);
+            }
+        }),
+        vscode.workspace.onDidRenameFiles((e) => {
+            for (const file of e.files) {
+                invalidateCachedPath(file.oldUri);
+                if (isTuPath(file.newUri.fsPath)) observeTuFromCurrentSource(file.newUri);
+                else if (isHeaderPath(file.newUri.fsPath)) graph.invalidate(file.newUri.fsPath);
+            }
+        }),
+        vscode.workspace.onDidDeleteFiles((e) => {
+            for (const uri of e.files) invalidateCachedPath(uri);
+        }),
     );
 }
 
@@ -316,7 +413,7 @@ async function cmdRefresh(): Promise<void> {
     }
     const uri = doc.uri.toString();
     const existing = store.get(uri);
-    if (existing) graph.invalidate(existing.includerTu);
+    if (existing) observeTuFromCurrentSource(vscode.Uri.file(existing.includerTu));
     clearDisabled(uri);
     markForced(uri);
     await reissueDidOpen(attachedClient, doc);
@@ -541,18 +638,29 @@ function showInOutput(title: string, text: string): void {
 // ============================================================================
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     applyConfigToGraph();
+    graphCacheContext = context;
+    restoreGraphCache(context);
 
     const ext = await getExtension();
     if (!ext) return;
 
     attach(ext);
+    registerGraphInvalidation(context);
 
     context.subscriptions.push(
         new PreambleStatus(),
         stateChangeEmitter,
         { dispose: () => stateSub?.dispose() },
+        graph.onDidChange(() => scheduleGraphCacheSave()),
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration(CFG_NS)) applyConfigToGraph();
+            if (e.affectsConfiguration(`${CFG_NS}.graphCache`)) {
+                if (graphCacheEnabled()) restoreGraphCache(context);
+                else if (graphCacheSaveTimer) {
+                    clearTimeout(graphCacheSaveTimer);
+                    graphCacheSaveTimer = undefined;
+                }
+            }
             if (e.affectsConfiguration(`${CFG_NS}.defaultSelector`)) void reissueDefaultSelectedHeaders();
         }),
         vscode.commands.registerCommand('clangd-preamble.reattach', () => cmdReattach(ext)),
@@ -569,7 +677,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     void handleActiveEditorChange(vscode.window.activeTextEditor);
 }
 
-export function deactivate(): void {
+export function deactivate(): Thenable<void> | void {
     stateSub?.dispose();
-    logChannel?.dispose();
+    if (graphCacheSaveTimer) {
+        clearTimeout(graphCacheSaveTimer);
+        graphCacheSaveTimer = undefined;
+    }
+    return saveGraphCacheNow().finally(() => logChannel?.dispose());
 }

@@ -54,7 +54,7 @@ All commands live under the `clangd` category in the command palette.
 | `clangd Preamble: Dump Include Graph` | Dump the observed TU/header graph into the output channel |
 | `clangd Preamble: Dump State for Current File` | Print state for the current header (preamble text, includer TU, line count) |
 | `clangd Preamble: Dump Suppressed Preamble Diagnostics` | List diagnostics that were suppressed because they fell inside the preamble |
-| `clangd Preamble: Scan Project for Includer TUs` | Walk all workspace folders for `.cpp/.cc/...` files and observe their includes — useful when no TU has been opened yet |
+| `clangd Preamble: Scan Project for Includer TUs` | Walk all workspace folders for `.cpp/.cc/...` files and observe their includes; the graph is cached for later sessions |
 
 ## Settings
 
@@ -64,6 +64,7 @@ All commands live under the `clangd` category in the command palette.
 | `clangd-preamble.maxPreambleLines` | `1500` | Cap on lines emitted into the synthetic preamble. |
 | `clangd-preamble.maxPreambleBytes` | `65536` | Cap on bytes emitted into the synthetic preamble. |
 | `clangd-preamble.projectScanLimit` | `2000` | Maximum number of TU files visited by `Scan Project for Includer TUs`. |
+| `clangd-preamble.graphCache` | `true` | Persist the observed/project-scanned TU include graph in VS Code workspace storage. Cached entries are validated by file size/mtime and invalidated by file change/delete/rename events. |
 | `clangd-preamble.defaultSelector` | `preambleSize` | Default preamble source selector for headers without a per-file override. Use `preambleSize` for the smallest include prefix before the header, or `lastSeen` for the most recently observed includer TU. |
 | `clangd-preamble.markerComment` | `// __NSC_PREAMBLE_END__` | Single-line comment appended to the preamble so it ends on a known marker. |
 | `clangd-preamble.log` | `false` | Log middleware activity to the `clangd Preamble` output channel. |
@@ -123,7 +124,11 @@ to be observed, the status item shows `Preamble: pending` instead.
     editor for the first time, active header state whose includer pick now
     resolves to that TU is replayed — so a header parsed against a disk-read
     companion gets re-evaluated when the user finally opens the source.
-12. **Compile-flags refresh.** `workspace/didChangeConfiguration` carries
+12. **Graph cache.** Observed and project-scanned TU include entries are stored
+    in VS Code workspace storage. On activation the cache is restored only for
+    files whose size and mtime still match; file change/delete/rename events
+    invalidate the affected TU/header entries.
+13. **Compile-flags refresh.** `workspace/didChangeConfiguration` carries
     clangd's `compilationDatabaseChanges` extension (used by
     [vscode-clangd-cmake](https://github.com/sr-tream/vscode-clangd-cmake)
     to deliver per-file flags). clangd updates its in-memory CDB on receipt
